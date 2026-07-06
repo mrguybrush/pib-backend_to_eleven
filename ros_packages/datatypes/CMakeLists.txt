@@ -41,6 +41,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"srv/DecryptToken.srv"
 	"srv/GetTokenExists.srv"
 	"srv/SetSolidStateRelay.srv"
+	"srv/SetRgbButtonColor.srv"
+	"srv/GetRgbButtonState.srv"
 	"action/RunProgram.action"
 	"action/RecordAudio.action"
 	"action/Chat.action"

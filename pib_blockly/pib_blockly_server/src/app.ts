@@ -16,7 +16,7 @@ function codeVisualToPython(codeVisual: string): string {
 
 function respond(res: http.ServerResponse<http.IncomingMessage>, code: number, message: string) {
     res.statusCode = code
-    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.end(message);
 }
 

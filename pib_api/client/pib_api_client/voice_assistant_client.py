@@ -8,6 +8,7 @@ ASSISTANT_MODEL_URL = URL_PREFIX + "/assistant-model/%s"
 PERSONALITY_URL = URL_PREFIX + "/voice-assistant/personality/%s"
 CHAT_URL = URL_PREFIX + "/voice-assistant/chat/%s"
 CHAT_MESSAGES_URL = URL_PREFIX + "/voice-assistant/chat/%s/messages"
+VOICE_SETTINGS_URL = URL_PREFIX + "/voice-assistant/voice-settings"
 
 
 class AssistantModel:
@@ -34,6 +35,14 @@ class Personality:
         if not successful:
             raise Exception("Could not find the assistant model")
         return model
+
+
+class VoiceSettings:
+    """Globale TTS-Einstellungen (lokale Piper-Stimme an/aus + gewaehlte Stimme)."""
+
+    def __init__(self, voice_settings_dto: dict[str, Any]):
+        self.local_voice_enabled = voice_settings_dto["localVoiceEnabled"]
+        self.local_voice_model = voice_settings_dto["localVoiceModel"]
 
 
 class Chat:
@@ -109,6 +118,19 @@ def update_chat_message(
     )
     successful, chat_message_dto = send_request(request)
     return successful, ChatMessage(chat_message_dto)
+
+
+def get_voice_settings() -> Tuple[bool, "VoiceSettings"]:
+    """Holt die globalen TTS-Einstellungen vom pib-API."""
+    request = Request(VOICE_SETTINGS_URL, method="GET")
+    successful, voice_settings_dto = send_request(request)
+    if not successful:
+        return False, None
+    try:
+        voice_settings = VoiceSettings(voice_settings_dto)
+    except Exception:
+        return False, None
+    return True, voice_settings
 
 
 def get_all_chat_messages(chat_id: str) -> List[ChatMessage]:

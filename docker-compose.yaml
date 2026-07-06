@@ -66,6 +66,25 @@ services:
     depends_on:
       - rosbridge-ws
 
+  ros-gesture-control:
+    image: ros_gesture_control
+    build:
+      context: .
+      dockerfile: ./ros_packages/gesture_control/Dockerfile
+    command: ros2 run gesture_control gesture_control
+    profiles:
+      - all
+      - gesture-control
+    networks:
+      - pib-network
+    environment:
+      - FLASK_API_BASE_URL=http://flask-app:5000
+    restart: always
+    depends_on:
+      - rosbridge-ws
+      - flask-app
+      - ros-motors
+
   ros-motors:
     image: ros_motors
     build:
@@ -130,8 +149,10 @@ services:
       - ALSA_CARD=Generic
       - FLASK_API_BASE_URL=http://flask-app:5000
       - VOICE_ASSISTANT_DIR=/app/ros2_ws/voice_assistant
+      - PIPER_HOME=/opt/piper
     volumes:
       - /media/dyan/project/projects/voice/:/data/voice
+      - /home/pib/piper:/opt/piper:ro
       - /dev/snd:/dev/snd
       - /dev/dsp:/dev/dsp
       - /etc/machine-id:/etc/machine-id

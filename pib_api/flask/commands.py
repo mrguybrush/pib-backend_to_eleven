@@ -241,8 +241,10 @@ def _get_motor_list() -> [dict[str, Any]]:
     bricklet_pins: str = "bricklet_pins"
 
     return [
-        {name: "turn_head_motor", bricklet_pins: [(2, 4)]},
-        {name: "tilt_forward_motor", bricklet_pins: [(2, 5)]},
+        # pins 4 and 5 on servo-bricklet 2 are burned on this robot -
+        # head motors moved to the free pins 3 and 6 (2026-07)
+        {name: "turn_head_motor", bricklet_pins: [(2, 3)]},
+        {name: "tilt_forward_motor", bricklet_pins: [(2, 6)]},
         {name: "upper_arm_left_rotation", bricklet_pins: [(3, 9)]},
         {name: "elbow_left", bricklet_pins: [(3, 8)]},
         {name: "lower_arm_left_rotation", bricklet_pins: [(3, 7)]},

@@ -14,7 +14,9 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from public_api_client import public_voice_client
+from pib_api_client import voice_assistant_client
 from . import util
+from . import piper_tts
 
 
 class AudioEncoding:
@@ -200,6 +202,29 @@ class AudioPlayerNode(Node):
             playback_item.finished_playing.wait()
         return response
 
+    def _resolve_local_voice(self) -> Optional[str]:
+        """
+        Prueft die globale Voice-Einstellung. Liefert den Namen der zu
+        verwendenden lokalen Piper-Stimme zurueck, wenn die lokale Ausgabe
+        aktiviert und die Stimme installiert ist -- sonst None (=> Cloud-TTS).
+        """
+        try:
+            successful, settings = voice_assistant_client.get_voice_settings()
+        except Exception as e:
+            self.get_logger().warn(f"could not fetch voice settings: {e}")
+            return None
+        if not successful or settings is None:
+            return None
+        if not settings.local_voice_enabled:
+            return None
+        if not piper_tts.is_available(settings.local_voice_model):
+            self.get_logger().warn(
+                f"local voice '{settings.local_voice_model}' enabled but not installed; "
+                f"falling back to cloud TTS"
+            )
+            return None
+        return settings.local_voice_model
+
     def play_audio_from_speech(
         self,
         request: PlayAudioFromSpeech.Request,
@@ -208,13 +233,32 @@ class AudioPlayerNode(Node):
 
         order = self.counter_next()
 
+        local_voice = self._resolve_local_voice()
+
         try:
-            data = public_voice_client.text_to_speech(
-                request.speech, request.gender, request.language, self.token
-            )
+            if local_voice is not None:
+                # Lokale Synthese ueber Piper (offline, ohne Cloud).
+                self.get_logger().info(f"using local piper voice: {local_voice}")
+                data = piper_tts.text_to_speech(request.speech, local_voice)
+            else:
+                # Standard: Cloud-/Public-API-TTS.
+                data = public_voice_client.text_to_speech(
+                    request.speech, request.gender, request.language, self.token
+                )
         except Exception as e:
             self.get_logger().error(f"text_to_speech failed: {e}")
-            return response
+            # Fallback auf Cloud, falls die lokale Synthese fehlschlaegt.
+            if local_voice is not None:
+                try:
+                    self.get_logger().warn("local TTS failed, falling back to cloud")
+                    data = public_voice_client.text_to_speech(
+                        request.speech, request.gender, request.language, self.token
+                    )
+                except Exception as e2:
+                    self.get_logger().error(f"cloud TTS fallback also failed: {e2}")
+                    return response
+            else:
+                return response
         data = self.adjust_data_granularity(data, BYTES_PER_CHUNK)
 
         playback_item = PlaybackItem(data, SPEECH_ENCODING, 0.2, order)

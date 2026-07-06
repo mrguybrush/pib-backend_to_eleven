@@ -10,6 +10,9 @@ from controller import (
     pose_controller,
     ip_controller,
     button_program_controller,
+    voice_settings_controller,
+    gesture_controller,
+    movement_sequence_controller,
 )
 
 app.register_blueprint(program_controller.bp, url_prefix="/program", name="program")
@@ -33,4 +36,17 @@ app.register_blueprint(pose_controller.bp, url_prefix="/pose", name="pose")
 app.register_blueprint(ip_controller.bp, url_prefix="/host-ip", name="host-ip")
 app.register_blueprint(
     button_program_controller.bp, url_prefix="/button-programs", name="button-programs"
+)
+app.register_blueprint(
+    voice_settings_controller.bp,
+    url_prefix="/voice-assistant/voice-settings",
+    name="voice-settings",
+)
+app.register_blueprint(
+    gesture_controller.bp, url_prefix="/gesture-control/gestures", name="gestures"
+)
+app.register_blueprint(
+    movement_sequence_controller.bp,
+    url_prefix="/gesture-control/sequences",
+    name="movement-sequences",
 )

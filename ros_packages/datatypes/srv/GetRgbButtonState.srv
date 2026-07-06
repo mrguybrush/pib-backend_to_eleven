@@ -1,0 +1,4 @@
+int32 bricklet_number
+---
+bool successful
+bool pressed

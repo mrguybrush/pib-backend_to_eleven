@@ -19,6 +19,7 @@ import tempfile
 
 from datatypes.action import RunProgram
 from datatypes.msg import ProgramOutputLine, ProgramInput
+from datatypes.srv import ClearPlaybackQueue
 
 import pib_blockly_client
 
@@ -64,6 +65,14 @@ class ProgramNode(Node):
             qos.QoSProfile(history=qos.HistoryPolicy.KEEP_ALL),
         )
 
+        # client for clearing the audio-playback-queue, so that cancelling
+        # a program also aborts any speech-output it has queued up
+        self.clear_playback_queue_client = self.create_client(
+            ClearPlaybackQueue,
+            "clear_playback_queue",
+            callback_group=ReentrantCallbackGroup(),
+        )
+
         # perform cleanup periodically
         self.cleanup_timer = self.create_timer(30, self.cleanup)
 
@@ -76,6 +85,15 @@ class ProgramNode(Node):
         self.process_lock = Lock()
 
         self.get_logger().info("Now Running PROGRAM")
+
+    def clear_playback_queue(self) -> None:
+        """abort any speech-output that is currently playing or queued"""
+        if not self.clear_playback_queue_client.service_is_ready():
+            self.get_logger().warn(
+                "'clear_playback_queue'-service not available, speech-output may continue playing"
+            )
+            return
+        self.clear_playback_queue_client.call_async(ClearPlaybackQueue.Request())
 
     def cleanup(self) -> None:
         with self.process_lock:
@@ -187,6 +205,7 @@ class ProgramNode(Node):
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                     process.terminate()
+                    self.clear_playback_queue()
                     return RunProgram.Result(exit_code=2)
 
                 # collect output of the user-program

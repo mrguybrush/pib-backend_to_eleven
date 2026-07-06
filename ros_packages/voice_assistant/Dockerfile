@@ -15,6 +15,7 @@ RUN apt-get update --fix-missing && \
         pulseaudio \
         portaudio19-dev \
         libusb-1.0-0-dev \
+        espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ./ros_packages/requirements.txt .
@@ -22,6 +23,8 @@ COPY ./ros_packages/requirements.txt .
 RUN pip install requests
 RUN pip install pyaudio
 RUN pip install google-genai
+# Lokale Text-to-Speech (offline) ueber Piper.
+RUN pip install piper-tts
 
 COPY ./pib_api/client ./client
 RUN pip install ./client

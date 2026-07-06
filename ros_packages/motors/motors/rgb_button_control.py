@@ -5,9 +5,14 @@ from rclpy.client import Client
 from rclpy.task import Future
 from tinkerforge.bricklet_rgb_led_button import BrickletRGBLEDButton
 from pib_motors.bricklet import uid_to_rgb_led_bricklet
-from datatypes.srv import ProxyRunProgramStart, ProxyRunProgramStop
+from datatypes.srv import (
+    ProxyRunProgramStart,
+    ProxyRunProgramStop,
+    SetRgbButtonColor,
+    GetRgbButtonState,
+)
 from datatypes.msg import ProxyRunProgramResult
-from pib_api_client import button_programs_client
+from pib_api_client import button_programs_client, bricklet_client
 
 ERROR_COLOR_DURATION_SECONDS = 2.0  # how long red stays before reverting to blue
 BLUE_COLOR = (0, 0, 255)  # blue color for idle state
@@ -58,6 +63,24 @@ class RGBButtonControl(Node):
 
         # maps proxy_goal_id -> uid
         self.goal_to_uid: dict[str, str] = {}
+
+        # bricklet_number (1,2,3 as used in the UI/Blockly) -> hardware uid,
+        # so blocks can address a button by its number.
+        self.number_to_uid: dict[int, str] = self._build_number_to_uid()
+
+        # Buttons whose colour was explicitly set by a program via
+        # set_rgb_button_color. Those are left alone by the periodic idle/
+        # running colour management until the node restarts, so a
+        # program-chosen colour actually sticks.
+        self.manual_color_override: set[str] = set()
+
+        # Services callable from Blockly-generated programs.
+        self.set_color_service = self.create_service(
+            SetRgbButtonColor, "set_rgb_button_color", self.set_rgb_button_color
+        )
+        self.get_state_service = self.create_service(
+            GetRgbButtonState, "get_rgb_button_state", self.get_rgb_button_state
+        )
 
         self.update_button_colors()
 
@@ -163,10 +186,70 @@ class RGBButtonControl(Node):
         except Exception as e:
             self.get_logger().error(f"Error setting color for UID {uid}: {str(e)}")
 
+    def _build_number_to_uid(self) -> dict[int, str]:
+        """Maps bricklet_number -> uid for RGB LED button bricklets, read
+        from the pib-api bricklet table (same identity the UI uses)."""
+        mapping: dict[int, str] = {}
+        successful, dto = bricklet_client.get_all_bricklets()
+        if not successful or not dto:
+            self.get_logger().warning(
+                "Could not load bricklets for number->uid mapping."
+            )
+            return mapping
+        for bricklet in dto.get("bricklets", []):
+            if (
+                bricklet.get("type") == "RGB LED Button Bricklet"
+                and bricklet.get("uid")
+                and bricklet.get("brickletNumber") is not None
+            ):
+                mapping[int(bricklet["brickletNumber"])] = bricklet["uid"]
+        return mapping
+
+    # ----- Services for Blockly programs -----
+    def set_rgb_button_color(
+        self, request: SetRgbButtonColor.Request, response: SetRgbButtonColor.Response
+    ) -> SetRgbButtonColor.Response:
+        uid = self.number_to_uid.get(request.bricklet_number)
+        if not uid:
+            self.get_logger().warning(
+                f"set_rgb_button_color: no button #{request.bricklet_number}"
+            )
+            response.successful = False
+            return response
+        # Clamp to valid 0..255 so a program can't pass out-of-range values.
+        r = max(0, min(255, request.r))
+        g = max(0, min(255, request.g))
+        b = max(0, min(255, request.b))
+        self.set_button_color(uid, r, g, b)
+        self.manual_color_override.add(uid)
+        response.successful = True
+        return response
+
+    def get_rgb_button_state(
+        self, request: GetRgbButtonState.Request, response: GetRgbButtonState.Response
+    ) -> GetRgbButtonState.Response:
+        uid = self.number_to_uid.get(request.bricklet_number)
+        bricklet = self.rgb_led_bricklets.get(uid) if uid else None
+        if not bricklet:
+            response.successful = False
+            response.pressed = False
+            return response
+        try:
+            state = bricklet.get_button_state()
+            response.pressed = state == BrickletRGBLEDButton.BUTTON_STATE_PRESSED
+            response.successful = True
+        except Exception as e:
+            self.get_logger().error(f"get_rgb_button_state error: {str(e)}")
+            response.successful = False
+            response.pressed = False
+        return response
+
     def update_button_colors(self) -> None:
         """Periodically updates button colors based on current program assignments."""
         self.load_button_programs()
         for uid in self.rgb_led_bricklets:
+            if uid in self.manual_color_override:
+                continue  # a program set this colour explicitly - leave it
             if uid in self.goal_to_uid.values():
                 continue  # don't override color while program is running
             if self.uid_to_program.get(uid):

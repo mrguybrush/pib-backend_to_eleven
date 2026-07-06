@@ -25,10 +25,13 @@ def code_visual_to_python(code_visual: str) -> Tuple[bool, str | None]:
         response = requests.request(
             method="POST",
             url=PIB_BLOCKLY_SERVER_URL,
-            headers={"Content-Type": "text/plain"},
+            headers={"Content-Type": "text/plain; charset=utf-8"},
             data=code_visual.encode(),
         )
         response.raise_for_status()
+        # the server sends utf-8; without this, requests falls back to
+        # ISO-8859-1 for text/* responses and umlauts get garbled
+        response.encoding = "utf-8"
         code_python = response.text
         return True, code_python
 
