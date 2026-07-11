@@ -9,8 +9,11 @@ export RESET_TEXT_COLOR="\e[0m"
 export NEW_LINE="\n"
 
 # Github repositories
-export FRONTEND="https://github.com/mrguybrush/cerebra-mod.git"
-export BACKEND="https://github.com/mrguybrush/pib-backend-mod.git"
+# FRONTEND/BACKEND sind private "mod"-Forks - Zugriff per Deploy-Key ueber
+# die SSH-Host-Aliase aus ~/.ssh/config (siehe UPGRADE.md "Neuinstallation
+# auf neuer SD-Karte"). IMITATION ist unveraendert und bleibt oeffentlich.
+export FRONTEND="git@github-cerebra-mod:mrguybrush/cerebra-mod.git"
+export BACKEND="git@github-pib-backend-mod:mrguybrush/pib-backend-mod.git"
 export IMITATION="https://github.com/pib-rocks/imitation.git"
 export APP_DIR="$HOME/app"
 export BACKEND_DIR="$APP_DIR/pib-backend"
