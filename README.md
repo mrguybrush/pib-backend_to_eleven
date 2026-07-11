@@ -1,5 +1,8 @@
 # Software setup
 
+> **Neuinstallation auf neuer SD-Karte oder Upgrade eines bestehenden pib:**
+> siehe [UPGRADE.md](UPGRADE.md).
+
 This script assumes:
 
 - that the newest Raspberry Pi OS is installed
