@@ -2,6 +2,7 @@ from app.app import app
 from controller import (
     assistant_model_controller,
     bricklet_controller,
+    bricklet_pin_controller,
     camera_controller,
     chat_controller,
     motor_controller,
@@ -33,6 +34,9 @@ app.register_blueprint(
     camera_controller.bp, url_prefix="/camera-settings", name="camera"
 )
 app.register_blueprint(bricklet_controller.bp, url_prefix="/bricklet", name="bricklet")
+app.register_blueprint(
+    bricklet_pin_controller.bp, url_prefix="/bricklet-pins", name="bricklet-pins"
+)
 app.register_blueprint(
     assistant_model_controller.bp, url_prefix="/assistant-model", name="assistant_model"
 )

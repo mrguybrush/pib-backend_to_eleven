@@ -31,6 +31,13 @@ services:
       - ./pib_api/flask/:/app
       - programs:/root/cerebra_programs
       - /home/pib/voice_recordings:/data/voice_recordings
+      # Read/write access to the Docker daemon - ONLY used to restart the
+      # ros-motors container from the Pinbelegung settings page (it caches
+      # the pin/motor wiring in memory at startup, so a pin reassignment
+      # only takes effect after a restart). The API surface exposed to the
+      # frontend is limited to that one specific action - see
+      # bricklet_pin_service.py's restart_motors_container().
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: always
     depends_on:
       - pib-blockly-server
