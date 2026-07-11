@@ -7,6 +7,7 @@ from pib_api_client import send_request, URL_PREFIX
 ASSISTANT_MODEL_URL = URL_PREFIX + "/assistant-model/%s"
 PERSONALITY_URL = URL_PREFIX + "/voice-assistant/personality/%s"
 CHAT_URL = URL_PREFIX + "/voice-assistant/chat/%s"
+ALL_CHATS_URL = URL_PREFIX + "/voice-assistant/chat"
 CHAT_MESSAGES_URL = URL_PREFIX + "/voice-assistant/chat/%s/messages"
 VOICE_SETTINGS_URL = URL_PREFIX + "/voice-assistant/voice-settings"
 
@@ -26,6 +27,9 @@ class Personality:
         self.pause_threshold = personality_dto["pauseThreshold"]
         self.message_history = personality_dto["messageHistory"]
         self.description = personality_dto.get("description")
+        self.camera_access_enabled = personality_dto.get(
+            "cameraAccessEnabled", False
+        )
         self.assistant_model = self._get_assistant_model(
             personality_dto["assistantModelId"]
         )
@@ -83,6 +87,14 @@ def get_chat(chat_id: str) -> Tuple[bool, Chat]:
     request = Request(CHAT_URL % chat_id, method="GET")
     successful, chat_dto = send_request(request)
     return successful, Chat(chat_dto)
+
+
+def get_all_chats() -> Tuple[bool, List[Chat]]:
+    request = Request(ALL_CHATS_URL, method="GET")
+    successful, dto = send_request(request)
+    if not successful or dto is None:
+        return False, []
+    return True, [Chat(chat_dto) for chat_dto in dto.get("voiceAssistantChats", [])]
 
 
 def get_personality_from_chat(chat_id: str) -> Tuple[bool, Personality]:

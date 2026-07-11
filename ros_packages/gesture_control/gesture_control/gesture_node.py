@@ -46,6 +46,11 @@ class GestureControlNode(Node):
         self.retarget_targets_publisher = self.create_publisher(
             String, "gesture_retarget_targets", 10
         )
+        # Raw per-side candidates (left AND right, before any motor
+        # assignment) for the calibration wizard's live left/right display.
+        self.retarget_candidates_publisher = self.create_publisher(
+            String, "gesture_retarget_candidates", 10
+        )
 
         self.gesture_capture = GestureCapture(self)
         self.timer = self.create_timer(TICK_PERIOD_S, self.on_timer)
@@ -79,6 +84,8 @@ class GestureControlNode(Node):
             self.gesture_capture.stop_mirroring()
         elif action == "set_joints":
             self.gesture_capture.set_enabled_joints(command.get("joints", []))
+        elif action == "reload_mapping":
+            self.gesture_capture.reload_assignment()
         else:
             self.get_logger().error(f"unknown gesture_capture_control action: {action}")
 
@@ -95,6 +102,10 @@ class GestureControlNode(Node):
             }
         )
         self.retarget_targets_publisher.publish(targets_msg)
+
+        candidates_msg = String()
+        candidates_msg.data = json.dumps(self.gesture_capture.latest_candidates)
+        self.retarget_candidates_publisher.publish(candidates_msg)
 
         if self.gesture_capture.result is not None:
             result_msg = String()

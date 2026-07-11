@@ -11,8 +11,12 @@ from controller import (
     ip_controller,
     button_program_controller,
     voice_settings_controller,
+    llm_settings_controller,
     gesture_controller,
     movement_sequence_controller,
+    motion_capture_joint_mapping_controller,
+    voice_recording_controller,
+    learning_group_controller,
 )
 
 app.register_blueprint(program_controller.bp, url_prefix="/program", name="program")
@@ -43,10 +47,30 @@ app.register_blueprint(
     name="voice-settings",
 )
 app.register_blueprint(
+    llm_settings_controller.bp,
+    url_prefix="/voice-assistant/llm-settings",
+    name="llm-settings",
+)
+app.register_blueprint(
     gesture_controller.bp, url_prefix="/gesture-control/gestures", name="gestures"
 )
 app.register_blueprint(
     movement_sequence_controller.bp,
     url_prefix="/gesture-control/sequences",
     name="movement-sequences",
+)
+app.register_blueprint(
+    motion_capture_joint_mapping_controller.bp,
+    url_prefix="/gesture-control/joint-mapping",
+    name="joint-mapping",
+)
+app.register_blueprint(
+    voice_recording_controller.bp,
+    url_prefix="/voice-recordings",
+    name="voice-recordings",
+)
+app.register_blueprint(
+    learning_group_controller.bp,
+    url_prefix="/learning-groups",
+    name="learning-groups",
 )

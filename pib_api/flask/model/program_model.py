@@ -11,3 +11,8 @@ class Program(db.Model):
     program_number = db.Column(
         db.String(50), unique=True, nullable=False, default=generate_uuid
     )
+    # None = not assigned to any learning group (visible only when no
+    # group is active) - see learning_group_model.py
+    learning_group_id = db.Column(
+        db.Integer, db.ForeignKey("learning_group.id"), nullable=True
+    )

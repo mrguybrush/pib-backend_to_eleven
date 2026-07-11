@@ -8,6 +8,7 @@
 # - Handles Stop/Start robustly by closing the live session and joining the worker thread.
 
 import asyncio
+import base64
 import os
 import logging
 import threading
@@ -30,6 +31,8 @@ from asyncio import QueueEmpty
 
 # service API to ChatNode (to avoid duplicating DB/publish logic here)
 from datatypes.srv import CreateOrUpdateChatMessage
+# camera stills, only polled when personality.camera_access_enabled is True
+from datatypes.srv import GetCameraImage
 
 import queue
 import time
@@ -57,6 +60,10 @@ CONFIG = {
     "output_audio_transcription": {},  # get assistant (output) transcript stream
 }
 ROS_AUDIO_TOPIC = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
+# how often (seconds) a camera still is polled and sent to Gemini as video
+# input, when the active personality has camera_access_enabled - Gemini Live
+# needs far less than the camera's native ~10 FPS for scene understanding.
+GEMINI_VIDEO_INTERVAL_S = float(os.getenv("GEMINI_VIDEO_INTERVAL_S", "2.0"))
 
 
 # ——— Live session lifetime management ———
@@ -75,6 +82,16 @@ CWC_TARGET_TOKENS = int(os.getenv("CWC_TARGET_TOKENS", "80000"))
 
 # Small delay before reconnecting (prevents tight loops on persistent failures)
 LIVE_RECONNECT_BACKOFF_S = float(os.getenv("LIVE_RECONNECT_BACKOFF_S", "0.5"))
+
+# pib's ReSpeaker 4 Mic Array (UAC1.0) has no onboard echo cancellation
+# (unlike the 6-channel ReSpeaker v2.0 this pipeline's channel-selection was
+# originally written for - see audio_streamer.py). Without it, the mic picks
+# up pib's own TTS playback and Gemini's live API treats that as the user
+# interrupting, so it cuts itself off mid-sentence. Dropping mic audio while
+# (and briefly after) pib is speaking prevents that self-interruption; real
+# barge-in (user interrupting pib) is intentionally sacrificed as the
+# trade-off until real acoustic echo cancellation is set up.
+MIC_MUTE_TRAIL_S = float(os.getenv("MIC_MUTE_TRAIL_S", "0.6"))
 
 
 class ReconnectRequested(RuntimeError):
@@ -201,6 +218,103 @@ class RosAudioBridge:
             logger.exception("RosAudioBridge crashed")
 
 
+class RosCameraBridge:
+    """
+    Polls the get_camera_image service on an interval and forwards JPEG
+    stills into an asyncio.Queue that send_video_frames() consumes.
+    Runs in its own thread, using the same lazy-client + spin_until_future_complete
+    pattern already used for the ChatNode service calls below.
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        out_queue: asyncio.Queue,
+        interval_s: float,
+    ):
+        self._loop = loop
+        self._out_queue = out_queue
+        self._interval_s = interval_s
+        self._thread: Optional[threading.Thread] = None
+        self._stop_evt = threading.Event()
+        self._node: Optional[Node] = None
+        self._client = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name="RosCameraBridge", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        """Signal shutdown and join quickly (best-effort)."""
+        self._stop_evt.set()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        if self._node:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+
+    def _enqueue(self, jpeg_bytes: bytes):
+        """Push a JPEG frame into the asyncio queue (thread-safe), dropping
+        a stale pending frame instead of blocking if send_video_frames is slow."""
+        if self._stop_evt.is_set():
+            return
+
+        async def _put():
+            if self._out_queue.full():
+                try:
+                    self._out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await self._out_queue.put(
+                {"data": jpeg_bytes, "mime_type": "image/jpeg"}
+            )
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_put(), self._loop)
+            fut.result(timeout=0.5)
+        except Exception:
+            pass
+
+    def _run(self):
+        try:
+            if not rclpy.ok():
+                rclpy.init()
+            self._node = Node("gemini_camera_bridge")
+            self._client = self._node.create_client(
+                GetCameraImage, "get_camera_image"
+            )
+            if not self._client.wait_for_service(timeout_sec=3.0):
+                logger.warning(
+                    "get_camera_image service not available yet; will keep retrying."
+                )
+
+            while not self._stop_evt.is_set():
+                if self._client.service_is_ready():
+                    try:
+                        future = self._client.call_async(GetCameraImage.Request())
+                        rclpy.spin_until_future_complete(
+                            self._node, future, timeout_sec=1.0
+                        )
+                        if future.done() and future.result() is not None:
+                            image_base64 = future.result().image_base64
+                            if image_base64:
+                                self._enqueue(base64.b64decode(image_base64))
+                    except Exception:
+                        logger.exception(
+                            "RosCameraBridge: get_camera_image call failed"
+                        )
+                self._stop_evt.wait(self._interval_s)
+
+        except Exception:
+            logger.exception("RosCameraBridge crashed")
+
+
 # ——————————————————————————————————————————
 #                Main audio loop
 # ——————————————————————————————————————————
@@ -228,8 +342,16 @@ class GeminiAudioLoop:
         self.playback_stream = None  # PyAudio output stream
         self.api_key = api_key
 
+        # monotonic timestamp until which mic audio should be dropped rather
+        # than sent upstream - see MIC_MUTE_TRAIL_S above. Kept extended by
+        # play_audio() for as long as pib's own speech is still playing.
+        self._mic_muted_until: float = 0.0
+
         # ROS bridge handle
         self._ros_bridge: Optional[RosAudioBridge] = None
+        # Camera bridge handle (only started when the personality has
+        # camera_access_enabled)
+        self._camera_bridge: Optional[RosCameraBridge] = None
 
         # Logging / turns (optional: write input/output wavs)
         self._turn_id = 0
@@ -596,6 +718,10 @@ class GeminiAudioLoop:
         try:
             while not self._stop_event.is_set():
                 msg = await self.out_queue.get()
+                if time.monotonic() < self._mic_muted_until:
+                    # pib is still speaking (or just finished) - drop this
+                    # chunk instead of feeding pib's own voice back to Gemini.
+                    continue
                 # If desired, uncomment to log input audio:
                 # data = msg.get("data", b"")
                 # if data:
@@ -612,6 +738,25 @@ class GeminiAudioLoop:
                 exc_info=True,
             )
             raise ReconnectRequested("send_realtime failed") from e
+
+    async def send_video_frames(self):
+        """Feeds JPEG stills from video_out_queue into the Gemini live session.
+        Only running when the active personality has camera_access_enabled."""
+        try:
+            while not self._stop_event.is_set():
+                msg = await self.video_out_queue.get()
+                await self.session.send_realtime_input(video=msg)
+        except asyncio.CancelledError:
+            logger.debug("send_video_frames: cancelled")
+            raise
+        except Exception as e:
+            if self._stop_event.is_set():
+                return
+            logger.warning(
+                "send_video_frames: upstream send failed; requesting reconnect.",
+                exc_info=True,
+            )
+            raise ReconnectRequested("send_video_frames failed") from e
 
     def _log_user_transcriptions(self, sc):
         """
@@ -783,6 +928,11 @@ class GeminiAudioLoop:
                 # Expecting a pair: (pcm_bytes, assistant_text_piece or None)
                 pcm, assistant_text_piece = item
 
+                # Extend the mic-mute window before playing so the mic is
+                # already ignored once this chunk's sound reaches it, and
+                # keeps being ignored as long as more chunks keep arriving.
+                self._mic_muted_until = time.monotonic() + MIC_MUTE_TRAIL_S
+
                 # Play the audio
                 await asyncio.to_thread(self.playback_stream.write, pcm)
                 # If there is Gemini text attached to this PCM chunk, send it now.
@@ -821,6 +971,7 @@ class GeminiAudioLoop:
 
         # Read chat personality/description from PIB to seed the model (once)
         description = "You are pib, a humanoid robot."
+        camera_enabled = False
         try:
             successful, personality = voice_assistant_client.get_personality_from_chat(
                 self._chat_id
@@ -830,6 +981,9 @@ class GeminiAudioLoop:
             else:
                 if getattr(personality, "description", None):
                     description = personality.description
+                camera_enabled = bool(
+                    getattr(personality, "camera_access_enabled", False)
+                )
         except Exception:
             logger.exception(
                 "Failed to fetch personality; using default system instruction."
@@ -868,6 +1022,7 @@ class GeminiAudioLoop:
                     self.session = session
                     self.audio_in_queue = asyncio.Queue[tuple[bytes, Optional[str]]]()
                     self.out_queue = asyncio.Queue(maxsize=5)
+                    self.video_out_queue = asyncio.Queue(maxsize=2)
                     self._log_lock = asyncio.Lock()
 
                     # Optional folders for WAV logs
@@ -889,6 +1044,20 @@ class GeminiAudioLoop:
                         asyncio.create_task(self.receive_audio()),
                         asyncio.create_task(self.play_audio()),
                     ]
+
+                    # Camera is opt-in per personality: only poll/send video
+                    # when camera_access_enabled is set on the active personality.
+                    if camera_enabled:
+                        self._camera_bridge = RosCameraBridge(
+                            asyncio.get_running_loop(),
+                            self.video_out_queue,
+                            GEMINI_VIDEO_INTERVAL_S,
+                        )
+                        self._camera_bridge.start()
+                        logger.info(
+                            "RosCameraBridge started (camera_access_enabled=True)."
+                        )
+                        tasks.append(asyncio.create_task(self.send_video_frames()))
 
                     # Wait until one task errors (or requests reconnect)
                     done, pending = await asyncio.wait(
@@ -937,6 +1106,14 @@ class GeminiAudioLoop:
                     except Exception:
                         pass
                     self._ros_bridge = None
+
+                # Stop camera bridge if it was started
+                if self._camera_bridge:
+                    try:
+                        self._camera_bridge.stop()
+                    except Exception:
+                        pass
+                    self._camera_bridge = None
 
                 # Close playback stream if still open
                 if self.playback_stream:

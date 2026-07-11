@@ -11,7 +11,7 @@ from datatypes.srv import GetCameraImage
 # NEW: service for AudioLoop → ChatNode bridge (keeps AudioLoop thin)
 from datatypes.srv import CreateOrUpdateChatMessage
 
-from pib_api_client import voice_assistant_client
+from pib_api_client import voice_assistant_client, llm_settings_client
 from public_api_client.public_voice_client import PublicApiChatMessage
 from rclpy.action import ActionServer
 from rclpy.action import CancelResponse
@@ -24,6 +24,8 @@ from rclpy.service import Service
 from std_msgs.msg import String
 
 from public_api_client import public_voice_client
+
+from voice_assistant import local_llm_client
 
 # In future, this code will be prepended to the description in a chat-request
 # if it is specified that code should be generated. The text will contain
@@ -328,16 +330,29 @@ class ChatNode(Node):
                     image_base64 = None
 
         try:
-            # Stream tokens from public API (yields text tokens)
-            with self.public_voice_client_lock:
-                tokens = public_voice_client.chat_completion(
+            # Stream tokens either from an LLM on the local network
+            # (assistant-model "local-llm", no tryb token needed) or from
+            # the public API (yields text tokens either way)
+            if local_llm_client.is_local_llm(personality.assistant_model.api_name):
+                _successful, llm_settings = llm_settings_client.get_llm_settings()
+                tokens = local_llm_client.chat_completion(
                     text=content,
                     description=description,
                     message_history=message_history,
                     image_base64=image_base64,
-                    model=personality.assistant_model.api_name,
-                    public_api_token=self.token,
+                    url=llm_settings.get("localLlmUrl") if _successful else None,
+                    model=llm_settings.get("localLlmModel") if _successful else None,
                 )
+            else:
+                with self.public_voice_client_lock:
+                    tokens = public_voice_client.chat_completion(
+                        text=content,
+                        description=description,
+                        message_history=message_history,
+                        image_base64=image_base64,
+                        model=personality.assistant_model.api_name,
+                        public_api_token=self.token,
+                    )
 
             # Regex for sentence / code chunking
             sentence_pattern = re.compile(

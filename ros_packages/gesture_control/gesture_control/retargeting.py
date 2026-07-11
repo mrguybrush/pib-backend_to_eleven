@@ -1,43 +1,43 @@
 """
 Layer 2 (Retargeting): pure geometry, no neural networks.
 
-Maps named landmark points (received from the browser's MediaPipe
-PoseLandmarker via gesture_node.py) to pib joint-angle targets.
+Two-stage design, so the user can fix mis-routed joints themselves without
+touching code:
+
+  1. compute_candidates(payload) - for every trackable joint ("elbow",
+     "shoulder_vertical", ...) computes a raw angle in DEGREES for BOTH the
+     tracked person's left and right side independently. This is the
+     "what does the camera see" stage and never mentions motor names.
+
+  2. retarget(payload, assignment) - applies a JointAssignment list that
+     says, per ROBOT MOTOR, which candidate + which tracked side + whether
+     to invert the sign feeds it. DEFAULT_ASSIGNMENT reproduces the
+     historical same-side behaviour (motor "elbow_left" <- candidate
+     "elbow", side "left"), but every entry can be overridden - see
+     motion_capture_mapping_client.get_joint_mapping() / the calibration
+     wizard in cerebra's Motion-Capture page (settings > "Zuordnung neu
+     kalibrieren"). That wizard is the fix for "erkannte Bewegung landet
+     manchmal auf dem falschen Arm": instead of guessing at the source of a
+     left/right mix-up (mirrored webcam vs. robot camera, a MediaPipe
+     handedness quirk, ...), the user watches the live left/right numbers
+     while moving and picks whichever one is actually their arm.
 
 Conventions:
-- Motor names are EXACTLY the names stored in pibdata.db (table `motor`,
-  e.g. "elbow_left", "shoulder_vertical_left") - the same names that
-  pib_api_client.motor_client and the apply_joint_trajectory service use.
-  (An earlier version used made-up uppercase names like "ELBOW_LEFT";
-  those never matched anything, so no joint ever moved.)
-- Target positions are CENTIDEGREES, matching the motors' configured
-  rotation_range_min/max in the database (-9000..9000 = -90..+90 deg).
-- Landmark payload per point: [x, y, score] or [x, y, score, z]. The
-  browser sends aspect-corrected coordinates with y pointing DOWN and
-  z negative towards the camera (MediaPipe convention). Without z, the
-  rotation joints cannot be computed and are simply skipped.
-- Mapping is same-side: the tracked person's right arm drives pib's
-  right arm.
-
-The angle->position conversions below (scale/offset/sign) are geometric
-best guesses; per-joint fine-tuning happens by adjusting scale/offset here
-or the motor's invert-flag / rotation range in the database. Every target
-is additionally clamped to the motor's live rotation range by the caller
-(gesture_capture.py) before anything moves.
+- Landmark payload: {"pose": {name: [x, y, score] or [x, y, score, z]},
+  "hands": {"left": {name: [x,y,z]}, "right": {...}}}, as published by
+  browser-pose-tracker.service.ts. "hands" entries are only present for a
+  side when a hand was actually detected there this frame.
+- Motor names / target positions are centidegrees, matching each motor's
+  configured rotation_range_min/max in pibdata.db (-9000..9000 = -90..+90
+  deg) - the same convention apply_joint_trajectory already uses.
+- pose coordinates: x/z pre-scaled by frame aspect, y downward, z negative
+  towards the camera (MediaPipe convention) - see browser-pose-tracker.
 """
 import math
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 Vec3 = tuple  # (x, y, z)
-
-
-@dataclass
-class JointMapping:
-    motor_name: str  # motor name exactly as in pibdata.db
-    compute: Callable  # (points: {name: Vec3}) -> Optional[float], angle in degrees
-    scale: float = 100.0  # degrees -> centidegrees
-    offset: float = 0.0  # centidegrees, added after scaling
 
 
 # --- vector helpers -------------------------------------------------------
@@ -107,34 +107,36 @@ _DOWN: Vec3 = (0.0, 1.0, 0.0)
 _MIN_DIRECTION_LENGTH = 0.05
 
 
-# --- per-joint angle computations -----------------------------------------
+# --- per-side candidate computations ---------------------------------------
+# Each function returns a single side's angle in degrees, or None if the
+# required points aren't present/visible this frame.
 
 
-def _elbow(points: dict, side: str) -> Optional[float]:
+def _elbow(pose: dict, side: str) -> Optional[float]:
     """flexion: 0 = fully stretched arm, grows as the elbow bends"""
     try:
-        s, e, w = points[f"{side}_shoulder"], points[f"{side}_elbow"], points[f"{side}_wrist"]
+        s, e, w = pose[f"{side}_shoulder"], pose[f"{side}_elbow"], pose[f"{side}_wrist"]
     except KeyError:
         return None
     return 180.0 - _vertex_angle(s, e, w)
 
 
-def _shoulder_vertical(points: dict, side: str) -> Optional[float]:
+def _shoulder_vertical(pose: dict, side: str) -> Optional[float]:
     """arm raise: 0 = arm hanging along the torso, 90 = horizontal"""
     try:
-        h, s, e = points[f"{side}_hip"], points[f"{side}_shoulder"], points[f"{side}_elbow"]
+        h, s, e = pose[f"{side}_hip"], pose[f"{side}_shoulder"], pose[f"{side}_elbow"]
     except KeyError:
         return None
     return _vertex_angle(h, s, e)
 
 
-def _shoulder_horizontal(points: dict, side: str) -> Optional[float]:
+def _shoulder_horizontal(pose: dict, side: str) -> Optional[float]:
     """azimuth of the upper arm in the horizontal plane: 0 = arm pointing
     sideways, positive = towards the camera (forward). Only meaningful when
     the arm is raised enough to have a horizontal direction; requires z."""
     try:
-        s, e = points[f"{side}_shoulder"], points[f"{side}_elbow"]
-        other = points["right_shoulder" if side == "left" else "left_shoulder"]
+        s, e = pose[f"{side}_shoulder"], pose[f"{side}_elbow"]
+        other = pose["right_shoulder" if side == "left" else "left_shoulder"]
     except KeyError:
         return None
     v = _sub(e, s)
@@ -149,11 +151,11 @@ def _shoulder_horizontal(points: dict, side: str) -> Optional[float]:
     return math.degrees(math.atan2(forward, outward))
 
 
-def _upper_arm_rotation(points: dict, side: str) -> Optional[float]:
+def _upper_arm_rotation(pose: dict, side: str) -> Optional[float]:
     """rotation of the forearm around the upper-arm axis. 0 = forearm
     hanging straight down from the elbow; requires z and a bent elbow."""
     try:
-        s, e, w = points[f"{side}_shoulder"], points[f"{side}_elbow"], points[f"{side}_wrist"]
+        s, e, w = pose[f"{side}_shoulder"], pose[f"{side}_elbow"], pose[f"{side}_wrist"]
     except KeyError:
         return None
     axis = _normalize(_sub(e, s))
@@ -165,13 +167,39 @@ def _upper_arm_rotation(points: dict, side: str) -> Optional[float]:
     return _signed_angle_around_axis(_DOWN, forearm, axis)
 
 
-def _lower_arm_rotation(points: dict, side: str) -> Optional[float]:
-    """pronation/supination of the forearm, estimated from the hand's
-    pinky->index direction around the elbow->wrist axis; requires the
-    hand keypoints (index/pinky) and z."""
+def _lower_arm_rotation_from_hand(hand: dict, elbow: Vec3) -> Optional[float]:
+    """Pronation/supination from real hand landmarks: palm normal (cross of
+    the hand's "forward" and "across" directions) projected around the
+    elbow->wrist axis. Far more precise than the pose-only fallback below,
+    since it uses the actual palm plane instead of two low-confidence
+    pose keypoints."""
     try:
-        e, w = points[f"{side}_elbow"], points[f"{side}_wrist"]
-        pinky, index = points[f"{side}_pinky"], points[f"{side}_index"]
+        wrist, index_mcp, middle_mcp, pinky_mcp = (
+            hand["wrist"],
+            hand["index_mcp"],
+            hand["middle_mcp"],
+            hand["pinky_mcp"],
+        )
+    except KeyError:
+        return None
+    axis = _normalize(_sub(wrist, elbow))
+    if axis is None:
+        return None
+    forward = _sub(middle_mcp, wrist)
+    across = _sub(pinky_mcp, index_mcp)
+    normal = _cross(forward, across)
+    if _norm(_perp_component(normal, axis)) < _MIN_DIRECTION_LENGTH / 2:
+        return None
+    return _signed_angle_around_axis(_DOWN, normal, axis)
+
+
+def _lower_arm_rotation_from_pose(pose: dict, side: str) -> Optional[float]:
+    """Fallback pronation/supination estimate from the Pose model's coarse
+    hand keypoints (pinky/index), used only when no real hand landmark data
+    is available for this side this frame."""
+    try:
+        e, w = pose[f"{side}_elbow"], pose[f"{side}_wrist"]
+        pinky, index = pose[f"{side}_pinky"], pose[f"{side}_index"]
     except KeyError:
         return None
     axis = _normalize(_sub(w, e))
@@ -180,51 +208,153 @@ def _lower_arm_rotation(points: dict, side: str) -> Optional[float]:
     hand = _sub(index, pinky)
     if _norm(_perp_component(hand, axis)) < _MIN_DIRECTION_LENGTH / 2:
         return None
-    # reference: hand-crease direction when the palm faces the body,
-    # approximated by "down" projected perpendicular to the forearm
     return _signed_angle_around_axis(_DOWN, hand, axis)
 
 
-# --- the mapping ------------------------------------------------------------
+def _lower_arm_rotation(pose: dict, hands: dict, side: str) -> Optional[float]:
+    hand = hands.get(side)
+    if hand:
+        try:
+            elbow = pose[f"{side}_elbow"]
+        except KeyError:
+            elbow = None
+        if elbow is not None:
+            from_hand = _lower_arm_rotation_from_hand(hand, elbow)
+            if from_hand is not None:
+                return from_hand
+    return _lower_arm_rotation_from_pose(pose, side)
+
+
+# --- candidate registry -----------------------------------------------------
+
+# candidate_key -> function(pose, hands, side) -> degrees|None
+CANDIDATE_FUNCTIONS: dict = {
+    "elbow": lambda pose, hands, side: _elbow(pose, side),
+    "shoulder_vertical": lambda pose, hands, side: _shoulder_vertical(pose, side),
+    "shoulder_horizontal": lambda pose, hands, side: _shoulder_horizontal(pose, side),
+    "upper_arm_rotation": lambda pose, hands, side: _upper_arm_rotation(pose, side),
+    "lower_arm_rotation": lambda pose, hands, side: _lower_arm_rotation(pose, hands, side),
+}
+
+
+def _as_xyz(points: dict) -> dict:
+    """{name: [x,y,score] or [x,y,score,z]} -> {name: (x,y,z)}"""
+    return {name: (v[0], v[1], v[3] if len(v) > 3 else 0.0) for name, v in points.items()}
+
+
+def compute_candidates(payload: dict) -> dict:
+    """
+    payload: {"pose": {name: [x,y,score(,z)]}, "hands": {"left"/"right":
+              {name: [x,y,z]}}}, as received from the browser.
+
+    Returns {candidate_key: {"left": degrees|None, "right": degrees|None}}
+    for every entry in CANDIDATE_FUNCTIONS - the raw "what does the camera
+    see" values, independent of any robot motor.
+    """
+    pose = _as_xyz(payload.get("pose", {}))
+    hands = {side: _as_xyz(pts) for side, pts in payload.get("hands", {}).items()}
+
+    candidates = {}
+    for key, fn in CANDIDATE_FUNCTIONS.items():
+        candidates[key] = {
+            "left": fn(pose, hands, "left"),
+            "right": fn(pose, hands, "right"),
+        }
+    return candidates
+
+
+# --- motor assignment --------------------------------------------------------
+
+
+@dataclass
+class JointAssignment:
+    motor_name: str  # motor name exactly as in pibdata.db
+    candidate_key: str  # key into CANDIDATE_FUNCTIONS / compute_candidates()
+    source_side: str = "left"  # "left" or "right" - which tracked side drives this motor
+    invert: bool = False
+    scale: float = 100.0  # degrees -> centidegrees
+    offset: float = 0.0  # centidegrees, added after scaling
+
+
+def _default_side_for_motor(motor_name: str) -> str:
+    return "left" if motor_name.endswith("_left") or "_left_" in motor_name else "right"
+
 
 # Per user requirement: shoulder, upper arm and lower arm including
-# rotations, both sides. Hip/torso and fingers are intentionally not mapped.
-# offset examples: elbow 0 deg (stretched) -> centered on 0; the shoulder
-# raise re-centers 0..180 deg onto the -9000..9000 motor range as needed.
-DEFAULT_MAPPING = [
-    JointMapping("elbow_left", lambda p: _elbow(p, "left")),
-    JointMapping("elbow_right", lambda p: _elbow(p, "right")),
-    JointMapping("shoulder_vertical_left", lambda p: _shoulder_vertical(p, "left")),
-    JointMapping("shoulder_vertical_right", lambda p: _shoulder_vertical(p, "right")),
-    JointMapping("shoulder_horizontal_left", lambda p: _shoulder_horizontal(p, "left")),
-    JointMapping("shoulder_horizontal_right", lambda p: _shoulder_horizontal(p, "right")),
-    JointMapping("upper_arm_left_rotation", lambda p: _upper_arm_rotation(p, "left")),
-    JointMapping("upper_arm_right_rotation", lambda p: _upper_arm_rotation(p, "right")),
-    JointMapping("lower_arm_left_rotation", lambda p: _lower_arm_rotation(p, "left")),
-    JointMapping("lower_arm_right_rotation", lambda p: _lower_arm_rotation(p, "right")),
+# rotations, both sides. Hip/torso and fingers are deliberately not mapped.
+# source_side defaults to the motor's own side (i.e. reproduces the
+# historical same-side behaviour) - override via the calibration wizard if
+# that turns out to be mirrored for a given camera setup.
+DEFAULT_ASSIGNMENT = [
+    JointAssignment("elbow_left", "elbow", "left"),
+    JointAssignment("elbow_right", "elbow", "right"),
+    JointAssignment("shoulder_vertical_left", "shoulder_vertical", "left"),
+    JointAssignment("shoulder_vertical_right", "shoulder_vertical", "right"),
+    JointAssignment("shoulder_horizontal_left", "shoulder_horizontal", "left"),
+    JointAssignment("shoulder_horizontal_right", "shoulder_horizontal", "right"),
+    JointAssignment("upper_arm_left_rotation", "upper_arm_rotation", "left"),
+    JointAssignment("upper_arm_right_rotation", "upper_arm_rotation", "right"),
+    JointAssignment("lower_arm_left_rotation", "lower_arm_rotation", "left"),
+    JointAssignment("lower_arm_right_rotation", "lower_arm_rotation", "right"),
 ]
 
 # all motor names this module can produce targets for (for UIs and clients)
-MAPPED_MOTOR_NAMES = [jm.motor_name for jm in DEFAULT_MAPPING]
+MAPPED_MOTOR_NAMES = [jm.motor_name for jm in DEFAULT_ASSIGNMENT]
+
+# candidate_key per motor, for building calibration-wizard UIs
+MOTOR_TO_CANDIDATE = {jm.motor_name: jm.candidate_key for jm in DEFAULT_ASSIGNMENT}
 
 
-def retarget(points: dict, mapping: list = DEFAULT_MAPPING) -> dict:
+def apply_assignment_overrides(overrides: list) -> list:
     """
-    points: {name: [x, y, score] or [x, y, score, z]} as received from the
-            browser over the browser_pose_landmarks ROS topic
+    overrides: list of dicts with motor_name/source_side/invert (as returned
+    by motion_capture_mapping_client.get_joint_mapping()). Returns a full
+    JointAssignment list: DEFAULT_ASSIGNMENT with any matching entries'
+    source_side/invert replaced. Unknown motor names in `overrides` are
+    ignored (e.g. a stale row from a previous mapping version).
+    """
+    by_motor = {o["motor_name"]: o for o in overrides or []}
+    result = []
+    for default in DEFAULT_ASSIGNMENT:
+        override = by_motor.get(default.motor_name)
+        if override is None:
+            result.append(default)
+            continue
+        result.append(
+            JointAssignment(
+                motor_name=default.motor_name,
+                candidate_key=default.candidate_key,
+                source_side=override.get("source_side", default.source_side),
+                invert=bool(override.get("invert", default.invert)),
+                scale=default.scale,
+                offset=default.offset,
+            )
+        )
+    return result
+
+
+def retarget(payload: dict, assignment: list = None) -> dict:
+    """
+    payload: see compute_candidates().
+    assignment: JointAssignment list (default: DEFAULT_ASSIGNMENT, i.e. no
+    per-installation calibration applied).
+
     Returns {motor_name: target_position_centidegrees (int)} for every
-    mapping entry whose required points are present and whose angle is
-    currently observable. Missing/unobservable joints are skipped for this
-    frame rather than guessed - the mirroring driver holds the last
-    known-good position in that case.
+    assignment entry whose source candidate/side is currently observable.
+    Missing/unobservable joints are skipped for this frame rather than
+    guessed - the mirroring driver holds the last known-good position in
+    that case.
     """
-    pts3 = {
-        name: (v[0], v[1], v[3] if len(v) > 3 else 0.0) for name, v in points.items()
-    }
+    candidates = compute_candidates(payload)
     targets = {}
-    for jm in mapping:
-        deg = jm.compute(pts3)
+    for jm in assignment or DEFAULT_ASSIGNMENT:
+        side_values = candidates.get(jm.candidate_key)
+        if not side_values:
+            continue
+        deg = side_values.get(jm.source_side)
         if deg is None:
             continue
+        if jm.invert:
+            deg = -deg
         targets[jm.motor_name] = int(round(jm.offset + jm.scale * deg))
     return targets

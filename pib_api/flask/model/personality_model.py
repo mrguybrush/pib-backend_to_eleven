@@ -15,6 +15,7 @@ class Personality(db.Model):
     description = db.Column(db.String(38000), nullable=True)
     pause_threshold = db.Column(db.Float, nullable=False)
     message_history = db.Column(db.Integer, nullable=False)
+    camera_access_enabled = db.Column(db.Boolean, nullable=False, default=False)
     chats = db.relationship(
         "Chat", backref="personality", lazy=True, cascade="all,delete"
     )

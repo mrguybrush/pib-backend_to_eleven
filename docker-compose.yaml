@@ -26,9 +26,11 @@ services:
     environment:
       - SQLALCHEMY_DATABASE_URI=sqlite:////app/pibdata.db
       - PIB_BLOCKLY_SERVER_URL=http://pib-blockly-server:2442
+      - VOICE_RECORDINGS_DIR=/data/voice_recordings
     volumes:
       - ./pib_api/flask/:/app
       - programs:/root/cerebra_programs
+      - /home/pib/voice_recordings:/data/voice_recordings
     restart: always
     depends_on:
       - pib-blockly-server
@@ -141,6 +143,8 @@ services:
       - voice_assistant
     networks:
       - pib-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - ros-audio.env
       - password.env
@@ -150,9 +154,23 @@ services:
       - FLASK_API_BASE_URL=http://flask-app:5000
       - VOICE_ASSISTANT_DIR=/app/ros2_ws/voice_assistant
       - PIPER_HOME=/opt/piper
+      # LLM im lokalen Netzwerk (OpenAI-kompatible API, z.B. Ollama):
+      # URL/Modell anpassen, Auswahl erfolgt ueber das Assistant-Model
+      # "Lokales Netzwerk-LLM" in Smart Connect / Personality-Einstellungen
+      - LOCAL_LLM_URL=${LOCAL_LLM_URL:-http://host.docker.internal:11434/v1}
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-llama3.2}
+      # Autonomer Modus: Assistent schaltet sich nach dem Start selbst ein
+      # und hoert dauerhaft zu (kein Aktivierungswort noetig)
+      - VOICE_ASSISTANT_AUTOSTART=${VOICE_ASSISTANT_AUTOSTART:-false}
+      - VOICE_ASSISTANT_AUTOSTART_CHAT_ID=${VOICE_ASSISTANT_AUTOSTART_CHAT_ID:-}
+      # same path as flask-app's VOICE_RECORDINGS_DIR - the play_wav
+      # Blockly-block bakes this path in at code-gen time (see
+      # play-wav-generator.ts), so both containers must agree on it
+      - VOICE_RECORDINGS_DIR=/data/voice_recordings
     volumes:
       - /media/dyan/project/projects/voice/:/data/voice
       - /home/pib/piper:/opt/piper:ro
+      - /home/pib/voice_recordings:/data/voice_recordings:ro
       - /dev/snd:/dev/snd
       - /dev/dsp:/dev/dsp
       - /etc/machine-id:/etc/machine-id

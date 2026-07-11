@@ -19,6 +19,10 @@ def create_program():
 
 @bp.route("", methods=["GET"])
 def get_all_programs():
+    # ?all=true bypasses the active-group filter and includes each
+    # program's group - used by the "Programme zuordnen" assignment table.
+    if request.args.get("all") == "true":
+        return jsonify({"programs": program_service.get_all_programs_admin()})
     programs = program_service.get_all_programs()
     return jsonify({"programs": programs_schema_without_code.dump(programs)})
 
@@ -53,3 +57,15 @@ def update_program_code(program_number: str):
     program_dto = program_schema_code_visual_only.load(request.json)
     program_service.update_program_code(program_number, program_dto)
     return program_schema_code_visual_only.dump(program_dto)
+
+
+@bp.route("/<string:program_number>/learning-group", methods=["PATCH"])
+def set_program_group(program_number: str):
+    group_id = (request.json or {}).get("learningGroupId")
+    return jsonify(program_service.set_program_group(program_number, group_id))
+
+
+@bp.route("/<string:program_number>/copy", methods=["POST"])
+def copy_program(program_number: str):
+    group_id = (request.json or {}).get("learningGroupId")
+    return jsonify(program_service.copy_program_to_group(program_number, group_id)), 201

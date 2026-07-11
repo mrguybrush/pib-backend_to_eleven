@@ -1,11 +1,19 @@
+import time
+
 import rclpy
 from rclpy.node import Node
 from rclpy.publisher import Publisher
 from rclpy.service import Service
 from rclpy.executors import SingleThreadedExecutor
 from pib_motors.bricklet import set_ssr_state, solid_state_relay_bricklet
+from pib_motors.motor import motors
+from pib_motors.resting_pose import apply_resting_pose
 from datatypes.msg import SolidStateRelayState
 from datatypes.srv import SetSolidStateRelay
+
+# how long the servos get to physically reach the resting pose before the
+# relay cuts their power on shutdown
+POWER_OFF_DELAY_SECONDS = 5.0
 
 
 class RelayControl(Node):
@@ -48,7 +56,26 @@ class RelayControl(Node):
         if self.state.turned_on == turned_on:
             return self.relay_available
         try:
-            set_ssr_state(turned_on)
+            if turned_on:
+                # Pre-position all servos at the resting pose while they are
+                # still unpowered: the moment power comes on, everything
+                # moves gently into the resting pose at once - replaces the
+                # old one-motor-at-a-time startup choreography.
+                self.get_logger().info(
+                    "pre-positioning resting pose, then powering servos on"
+                )
+                apply_resting_pose(motors, self.get_logger().warn)
+                set_ssr_state(True)
+            else:
+                # Park the robot before cutting power: command the resting
+                # pose while still powered, give the servos time to actually
+                # get there, then switch off.
+                self.get_logger().info(
+                    f"moving to resting pose, powering off in {POWER_OFF_DELAY_SECONDS}s"
+                )
+                apply_resting_pose(motors, self.get_logger().warn)
+                time.sleep(POWER_OFF_DELAY_SECONDS)
+                set_ssr_state(False)
             self.state.turned_on = turned_on
         except Exception as e:
             self.get_logger().error(

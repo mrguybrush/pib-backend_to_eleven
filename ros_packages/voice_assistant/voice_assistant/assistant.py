@@ -1,3 +1,4 @@
+import os
 from collections import deque
 from typing import Any, Callable, Optional
 
@@ -13,7 +14,7 @@ from datatypes.srv import (
     GetChatIsListening,
     SendChatMessage,
 )
-from pib_api_client import voice_assistant_client
+from pib_api_client import voice_assistant_client, llm_settings_client
 from pib_api_client.voice_assistant_client import Personality
 from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
@@ -27,6 +28,21 @@ from voice_assistant import START_SIGNAL_FILE, STOP_SIGNAL_FILE
 from voice_assistant.audio_loop import GeminiAudioLoop
 
 MAX_SILENT_SECONDS_BEFORE = 8.0
+
+# Autonomous mode: if enabled, the assistant switches itself on shortly
+# after startup - no UI interaction needed. It then listens continuously
+# (no wake word: the legacy path loops record->transcribe->answer, Gemini
+# keeps a live audio session open the whole time).
+#   VOICE_ASSISTANT_AUTOSTART=true|false
+#   VOICE_ASSISTANT_AUTOSTART_CHAT_ID=<chat-uuid>  (optional; default:
+#     the first existing chat)
+AUTOSTART = os.getenv("VOICE_ASSISTANT_AUTOSTART", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+AUTOSTART_CHAT_ID = os.getenv("VOICE_ASSISTANT_AUTOSTART_CHAT_ID", "")
+AUTOSTART_DELAY_SECONDS = 10.0  # give audio/motor/flask services time to boot
 
 
 class VoiceAssistantNode(Node):
@@ -136,7 +152,36 @@ class VoiceAssistantNode(Node):
         )
         self.run_program_client.wait_for_server()
 
+        if AUTOSTART:
+            self.autostart_timer = self.create_timer(
+                AUTOSTART_DELAY_SECONDS, self.autostart_once
+            )
+            self.get_logger().info(
+                f"autonomous mode: will self-activate in {AUTOSTART_DELAY_SECONDS}s"
+            )
+
         self.get_logger().info("Now running VA")
+
+    def autostart_once(self) -> None:
+        """One-shot: turn the assistant on without any UI interaction."""
+        self.autostart_timer.cancel()
+        if self.state.turned_on:
+            return
+        chat_id = AUTOSTART_CHAT_ID
+        if not chat_id:
+            successful, chats = voice_assistant_client.get_all_chats()
+            if not successful or not chats:
+                self.get_logger().error(
+                    "autonomous mode: no chat found - cannot self-activate"
+                )
+                return
+            chat_id = chats[0].chatId
+        if self.update_state(True, chat_id):
+            self.get_logger().info(
+                f"autonomous mode: assistant self-activated (chat {chat_id})"
+            )
+        else:
+            self.get_logger().error("autonomous mode: self-activation failed")
 
     # client accessors ------------------------------------------------------------------
 
@@ -569,6 +614,17 @@ class VoiceAssistantNode(Node):
         # GEMINI path: short-circuit legacy logic
         if "gemini" in api_name:
             if not self.gemini_loop.is_listening:
+                # read the API key fresh on every activation, so a change
+                # in Settings takes effect without restarting this node
+                key_successful, llm_settings = llm_settings_client.get_llm_settings()
+                self.gemini_loop.api_key = (
+                    llm_settings.get("geminiApiKey") or "" if key_successful else ""
+                )
+                if not self.gemini_loop.api_key:
+                    self.get_logger().error(
+                        "no Gemini API key configured (Einstellungen > Chat-LLM) - cannot start"
+                    )
+                    return False
                 self.gemini_loop.start(chat_id=chat_id)
                 self.play_audio_from_file(START_SIGNAL_FILE)
             else:

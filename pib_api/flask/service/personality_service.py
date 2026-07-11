@@ -18,6 +18,7 @@ def create_personality(personality_dto: Any) -> List[Personality]:
         pause_threshold=personality_dto["pause_threshold"],
         message_history=personality_dto["message_history"],
         assistant_model_id=personality_dto["assistant_model_id"],
+        camera_access_enabled=personality_dto.get("camera_access_enabled", False),
     )
     db.session.add(personality)
     db.session.flush()
@@ -32,6 +33,8 @@ def update_personality(personality_id: str, personality_dto: Any) -> Personality
     personality.message_history = personality_dto["message_history"]
     if "description" in personality_dto:
         personality.description = personality_dto["description"]
+    if "camera_access_enabled" in personality_dto:
+        personality.camera_access_enabled = personality_dto["camera_access_enabled"]
     personality.assistant_model_id = personality_dto["assistant_model_id"]
     db.session.flush()
     return personality

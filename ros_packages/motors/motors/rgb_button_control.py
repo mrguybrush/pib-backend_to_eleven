@@ -187,8 +187,11 @@ class RGBButtonControl(Node):
             self.get_logger().error(f"Error setting color for UID {uid}: {str(e)}")
 
     def _build_number_to_uid(self) -> dict[int, str]:
-        """Maps bricklet_number -> uid for RGB LED button bricklets, read
-        from the pib-api bricklet table (same identity the UI uses)."""
+        """Maps button number (1..n, as offered in the Blockly dropdown) to
+        the hardware uid. Blockly counts the RGB LED button bricklets
+        starting at 1, while their bricklet_number in the database continues
+        the global numbering after the servo/relay bricklets (e.g. 5,6,7) -
+        so the buttons are indexed by their order, not by bricklet_number."""
         mapping: dict[int, str] = {}
         successful, dto = bricklet_client.get_all_bricklets()
         if not successful or not dto:
@@ -196,20 +199,33 @@ class RGBButtonControl(Node):
                 "Could not load bricklets for number->uid mapping."
             )
             return mapping
-        for bricklet in dto.get("bricklets", []):
-            if (
-                bricklet.get("type") == "RGB LED Button Bricklet"
-                and bricklet.get("uid")
-                and bricklet.get("brickletNumber") is not None
-            ):
-                mapping[int(bricklet["brickletNumber"])] = bricklet["uid"]
+        rgb_bricklets = [
+            bricklet
+            for bricklet in dto.get("bricklets", [])
+            if bricklet.get("type") == "RGB LED Button Bricklet"
+            and bricklet.get("uid")
+            and bricklet.get("brickletNumber") is not None
+        ]
+        rgb_bricklets.sort(key=lambda bricklet: int(bricklet["brickletNumber"]))
+        for index, bricklet in enumerate(rgb_bricklets, start=1):
+            mapping[index] = bricklet["uid"]
+        self.get_logger().info(f"button number -> uid mapping: {mapping}")
         return mapping
+
+    def _resolve_button_uid(self, button_number: int) -> str | None:
+        """number -> uid, rebuilding the mapping once if the number is
+        unknown (e.g. the pib-api was not reachable yet at node startup)."""
+        uid = self.number_to_uid.get(button_number)
+        if uid is None:
+            self.number_to_uid = self._build_number_to_uid()
+            uid = self.number_to_uid.get(button_number)
+        return uid
 
     # ----- Services for Blockly programs -----
     def set_rgb_button_color(
         self, request: SetRgbButtonColor.Request, response: SetRgbButtonColor.Response
     ) -> SetRgbButtonColor.Response:
-        uid = self.number_to_uid.get(request.bricklet_number)
+        uid = self._resolve_button_uid(request.bricklet_number)
         if not uid:
             self.get_logger().warning(
                 f"set_rgb_button_color: no button #{request.bricklet_number}"
@@ -228,7 +244,7 @@ class RGBButtonControl(Node):
     def get_rgb_button_state(
         self, request: GetRgbButtonState.Request, response: GetRgbButtonState.Response
     ) -> GetRgbButtonState.Response:
-        uid = self.number_to_uid.get(request.bricklet_number)
+        uid = self._resolve_button_uid(request.bricklet_number)
         bricklet = self.rgb_led_bricklets.get(uid) if uid else None
         if not bricklet:
             response.successful = False

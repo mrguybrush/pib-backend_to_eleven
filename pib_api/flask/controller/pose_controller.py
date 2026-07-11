@@ -21,6 +21,10 @@ def create_pose():
 
 @bp.route("", methods=["GET"])
 def get_all_poses():
+    # ?all=true bypasses the active-group filter and includes each pose's
+    # group - used by the "Programme zuordnen" assignment table.
+    if request.args.get("all") == "true":
+        return jsonify({"poses": pose_service.get_all_poses_admin()})
     poses = pose_service.get_all_poses()
     return jsonify({"poses": poses_schema.dump(poses)})
 
@@ -55,3 +59,15 @@ def update_motor_positions_of_pose(pose_id: str):
     pose_dto = pose_schema_motor_positions_only.load(request.json)
     pose = pose_service.update_motor_positions_of_pose(pose_id, pose_dto)
     return pose_schema_motor_positions_only.dump(pose)
+
+
+@bp.route("/<string:pose_id>/learning-group", methods=["PATCH"])
+def set_pose_group(pose_id: str):
+    group_id = (request.json or {}).get("learningGroupId")
+    return jsonify(pose_service.set_pose_group(pose_id, group_id))
+
+
+@bp.route("/<string:pose_id>/copy", methods=["POST"])
+def copy_pose(pose_id: str):
+    group_id = (request.json or {}).get("learningGroupId")
+    return jsonify(pose_service.copy_pose_to_group(pose_id, group_id)), 201

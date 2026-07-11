@@ -29,7 +29,7 @@ Safety notes (see plan, "Sicherheit - besonders kritisch"):
 import time
 
 from datatypes.srv import ApplyJointTrajectory
-from pib_api_client import motor_client
+from pib_api_client import motor_client, motion_capture_mapping_client
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from . import retargeting
@@ -79,6 +79,15 @@ class GestureCapture:
         # on every tick with fresh landmarks - even while mirroring is off -
         # so the UI can always display live values per robot joint.
         self.latest_raw_targets = {}
+        # Latest per-side candidate angles (both left AND right, before any
+        # motor assignment is applied) - what the calibration wizard shows
+        # live while the user moves and picks which side is which.
+        self.latest_candidates = {}
+        # Motor assignment (which tracked side + invert drives each motor).
+        # Reloaded from the DB whenever mirroring/capture (re-)starts, same
+        # as clamp_ranges - a mapping saved in the wizard should apply on
+        # the next activation without requiring a node restart.
+        self.assignment = retargeting.DEFAULT_ASSIGNMENT
         self.mode = None
         self.start_time = None
         self.end_time = None
@@ -94,9 +103,10 @@ class GestureCapture:
     def start_mirroring(self):
         if self.mirroring:
             return
-        # Reload clamp ranges each time - motor limits may have been changed
-        # in the joint-control UI since the last session.
+        # Reload clamp ranges + joint-assignment each time - motor limits or
+        # the calibrated mapping may have changed since the last session.
         self.clamp_ranges = self._load_clamp_ranges()
+        self.assignment = self._load_assignment()
         self.last_targets = {}
         self.mirroring = True
         self.node.get_logger().info(
@@ -109,6 +119,12 @@ class GestureCapture:
             return
         self.mirroring = False
         self.node.get_logger().info("live mirroring OFF - holding last position")
+
+    def reload_assignment(self):
+        """Re-reads the joint mapping from the DB immediately, without
+        requiring mirroring to be toggled off/on - lets the calibration
+        wizard apply a just-saved mapping right away."""
+        self.assignment = self._load_assignment()
 
     def set_enabled_joints(self, joint_names):
         """Restrict mirroring/capture to these motors (names as in pibdata.db).
@@ -134,6 +150,7 @@ class GestureCapture:
         self.last_targets = {}
         self.frames = []
         self.clamp_ranges = self._load_clamp_ranges()
+        self.assignment = self._load_assignment()
         self.node.get_logger().info(
             f"gesture capture started: mode={mode} duration={duration_s}s "
             f"motors_with_known_range={list(self.clamp_ranges.keys())}"
@@ -145,14 +162,21 @@ class GestureCapture:
             self._finish()
 
     def tick(self, landmarks):
-        """landmarks: {name: [x, y, score]} dict from the browser, or None
-        if nothing has been received recently (see gesture_node.py's
-        staleness check) - in that case this tick just holds position."""
+        """landmarks: {"pose": {name: [x,y,score(,z)]}, "hands": {"left"/
+        "right": {name: [x,y,z]}}} dict from the browser (see
+        retargeting.compute_candidates), or None if nothing has been
+        received recently (see gesture_node.py's staleness check) - in that
+        case this tick just holds position."""
         # Always retarget fresh landmarks, even when nothing is mirrored -
-        # the UI displays these live values in its joint table.
+        # the UI displays these live values in its joint table, and the
+        # calibration wizard displays the raw per-side candidates.
         if landmarks:
-            self.latest_raw_targets = retargeting.retarget(landmarks)
+            self.latest_candidates = retargeting.compute_candidates(landmarks)
+            self.latest_raw_targets = retargeting.retarget(
+                landmarks, assignment=self.assignment
+            )
         else:
+            self.latest_candidates = {}
             self.latest_raw_targets = {}
 
         if not (self.active or self.mirroring):
@@ -185,9 +209,26 @@ class GestureCapture:
         if now >= self.end_time:
             self._finish()
 
+    def _load_assignment(self):
+        successful, dtos = motion_capture_mapping_client.get_joint_mapping()
+        if not successful:
+            self.node.get_logger().warn(
+                "could not load joint mapping from pib-api; using defaults"
+            )
+            return retargeting.DEFAULT_ASSIGNMENT
+        overrides = [
+            {
+                "motor_name": dto["motorName"],
+                "source_side": dto["sourceSide"],
+                "invert": dto["invert"],
+            }
+            for dto in dtos
+        ]
+        return retargeting.apply_assignment_overrides(overrides)
+
     def _load_clamp_ranges(self):
         ranges = {}
-        for jm in retargeting.DEFAULT_MAPPING:
+        for jm in retargeting.DEFAULT_ASSIGNMENT:
             successful, settings = motor_client.get_motor_settings(jm.motor_name)
             if successful and settings:
                 ranges[jm.motor_name] = (

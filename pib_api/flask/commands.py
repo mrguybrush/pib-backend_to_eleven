@@ -59,8 +59,14 @@ def _create_bricklet_data() -> None:
         "rotation_range_min": -9000,
         "rotation_range_max": 9000,
         "velocity": 16000,
-        "acceleration": 10000,
-        "deceleration": 5000,
+        # Softer than the original 10000/5000 - the big joints (head,
+        # shoulders, elbows, arm rotations, wrists all use this base
+        # default; only fingers/thumbs override it below) were snapping
+        # too hard into position, especially right after the solid-state
+        # relay powers the servos back on (2026-07, see motor_control.py's
+        # on_ssr_state_change fix for the related "slams into pose" bug).
+        "acceleration": 5000,
+        "deceleration": 3000,
         "period": 19500,
         "turned_on": True,
         "visible": True,
@@ -154,7 +160,12 @@ def _create_chat_data_and_assistant() -> None:
         api_name="gemini-2.5-flash",
         has_image_support=False,
     )
-    db.session.add_all([gpt4o2, gpt4o1, gpt3, claude, gemini_text])
+    local_llm = AssistantModel(
+        visual_name="Lokales Netzwerk-LLM",
+        api_name="local-llm",
+        has_image_support=False,
+    )
+    db.session.add_all([gpt4o2, gpt4o1, gpt3, claude, gemini_text, local_llm])
     db.session.flush()
 
     p_eva = Personality(
