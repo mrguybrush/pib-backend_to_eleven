@@ -34,7 +34,7 @@ Conventions:
   towards the camera (MediaPipe convention) - see browser-pose-tracker.
 """
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 Vec3 = tuple  # (x, y, z)
@@ -225,6 +225,34 @@ def _lower_arm_rotation(pose: dict, hands: dict, side: str) -> Optional[float]:
     return _lower_arm_rotation_from_pose(pose, side)
 
 
+def _hand_openness(hand: dict) -> Optional[float]:
+    """0 = closed fist, 100 = fully open/spread hand. Average distance from
+    the 5 fingertips to the wrist, normalized by a hand-size reference
+    (wrist -> middle-finger knuckle) so it stays roughly scale-invariant
+    across hand size / distance to camera. Drives the whole hand (all finger
+    motors of a side) as one open/close signal - individual per-finger
+    control was tried but MediaPipe's per-finger landmarks proved too noisy
+    to feel like real detection. The 0.9/2.3 reference ratios are a first
+    estimate (no closed-fist hardware reference was available) - tune
+    per-hand-row in the mapping table if open/close doesn't reach the ends."""
+    try:
+        wrist = hand["wrist"]
+        middle_mcp = hand["middle_mcp"]
+        tips = [
+            hand[name]
+            for name in ("thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip")
+        ]
+    except KeyError:
+        return None
+    ref = _norm(_sub(middle_mcp, wrist))
+    if ref < 1e-6:
+        return None
+    avg_tip_dist = sum(_norm(_sub(t, wrist)) for t in tips) / len(tips)
+    ratio = avg_tip_dist / ref
+    openness = (ratio - 0.9) / (2.3 - 0.9) * 100.0
+    return max(0.0, min(100.0, openness))
+
+
 # --- candidate registry -----------------------------------------------------
 
 # candidate_key -> function(pose, hands, side) -> degrees|None
@@ -234,6 +262,7 @@ CANDIDATE_FUNCTIONS: dict = {
     "shoulder_horizontal": lambda pose, hands, side: _shoulder_horizontal(pose, side),
     "upper_arm_rotation": lambda pose, hands, side: _upper_arm_rotation(pose, side),
     "lower_arm_rotation": lambda pose, hands, side: _lower_arm_rotation(pose, hands, side),
+    "hand_openness": lambda pose, hands, side: _hand_openness(hands.get(side, {})),
 }
 
 
@@ -272,8 +301,34 @@ class JointAssignment:
     candidate_key: str  # key into CANDIDATE_FUNCTIONS / compute_candidates()
     source_side: str = "left"  # "left" or "right" - which tracked side drives this motor
     invert: bool = False
-    scale: float = 100.0  # degrees -> centidegrees
+    # Fallback degrees -> centidegrees mapping, used only until the joint
+    # is two-point calibrated (see candidate_low_deg/candidate_high_deg
+    # below) - at that point gesture_capture.py's
+    # _with_two_point_calibration() recomputes both from the calibration,
+    # overriding whatever is set here.
+    scale: float = 100.0
     offset: float = 0.0  # centidegrees, added after scaling
+    # Per-installation two-point calibration, set via the "Ist-Wert"
+    # buttons in the mapping table: the RAW candidate reading (same units
+    # shown live in the left/right columns) at the joint's "low" and
+    # "high" physical extremes (e.g. arm hanging vs. arm fully raised).
+    # When both are set, scale/offset are recomputed at runtime so
+    # candidate_low_deg maps exactly onto this motor's own
+    # rotation_range_min and candidate_high_deg onto rotation_range_max -
+    # no manual scale tuning, and no assumption that "neutral" reads
+    # exactly 0 (real camera/body geometry rarely does).
+    candidate_low_deg: Optional[float] = None
+    candidate_high_deg: Optional[float] = None
+    # Absolute target limits in MOTOR DEGREES (applied after scale/offset/
+    # calibration, converted to centidegrees internally) - lets the user
+    # rein in the full servo range if desired, e.g. "never rotate this
+    # joint backward past its resting position". None = no extra limit,
+    # the motor's own rotation_range_min/max is the only bound.
+    min_deg: Optional[float] = None
+    max_deg: Optional[float] = None
+    # Per-motor speed cap: percent (0-100) of gesture_capture's
+    # MAX_STEP_PER_TICK. 100 = full global speed.
+    speed_percent: float = 100.0
 
 
 def _default_side_for_motor(motor_name: str) -> str:
@@ -281,21 +336,133 @@ def _default_side_for_motor(motor_name: str) -> str:
 
 
 # Per user requirement: shoulder, upper arm and lower arm including
-# rotations, both sides. Hip/torso and fingers are deliberately not mapped.
+# rotations, plus hand open/close, both sides. Hip/torso are deliberately
+# not mapped, legs don't exist as motors at all.
 # source_side defaults to the motor's own side (i.e. reproduces the
-# historical same-side behaviour) - override via the calibration wizard if
-# that turns out to be mirrored for a given camera setup.
+# historical same-side behaviour) - override via the mapping table in
+# cerebra's Motion-Capture page if that turns out to be mirrored for a given
+# camera setup.
+#
+# offset: centidegrees added after scaling, so that a candidate angle of 0
+# (person standing with arms hanging, palms facing inward) maps to the
+# robot's own matching rest pose instead of the arbitrary position "0"
+# happens to be. FALLBACK ONLY: gesture_capture.py's _load_assignment()
+# overrides these at runtime with the live "Startup/Resting" pose's actual
+# motor positions (same pose relay_control.py parks the robot in on power
+# on/off, editable on the Poses page) - these constants only apply if that
+# lookup fails. The values below are a one-time snapshot (2026-07-15) of
+# that pose, not a substitute for it. shoulder_horizontal's candidate is
+# unobservable (None) with arms hanging, but the offset is set for
+# consistency anyway and takes effect once the arm is raised.
+_ELBOW_OFFSET = -5500.0  # rest pose: elbow -55 deg
+_SHOULDER_VERTICAL_OFFSET = -6600.0  # rest pose: shoulder_vertical -66 deg
+_SHOULDER_HORIZONTAL_OFFSET = 8600.0  # rest pose: shoulder_horizontal 86 deg
+_UPPER_ARM_ROTATION_OFFSET = -2000.0  # rest pose: upper_arm_rotation -20 deg
+_LOWER_ARM_ROTATION_OFFSET = 3600.0  # rest pose: lower_arm_rotation 36 deg
+
+# Each finger's stretch/opposition candidate is 0 .. 100; no closed-fist
+# hardware reference was available, so this deliberately saturates at each
+# finger motor's own DB-configured rotation range (see _clamp_and_rate_limit
+# in gesture_capture.py) rather than at a calibrated "true" open/closed
+# angle. If a finger moves too far, the wrong way, or not at all, tune it
+# per-row in the mapping table (scale/min_deg/max_deg/invert) - no code
+# change needed.
+_HAND_SCALE = 200.0
+_HAND_OFFSET = -10000.0
+
 DEFAULT_ASSIGNMENT = [
-    JointAssignment("elbow_left", "elbow", "left"),
-    JointAssignment("elbow_right", "elbow", "right"),
-    JointAssignment("shoulder_vertical_left", "shoulder_vertical", "left"),
-    JointAssignment("shoulder_vertical_right", "shoulder_vertical", "right"),
-    JointAssignment("shoulder_horizontal_left", "shoulder_horizontal", "left"),
-    JointAssignment("shoulder_horizontal_right", "shoulder_horizontal", "right"),
-    JointAssignment("upper_arm_left_rotation", "upper_arm_rotation", "left"),
-    JointAssignment("upper_arm_right_rotation", "upper_arm_rotation", "right"),
-    JointAssignment("lower_arm_left_rotation", "lower_arm_rotation", "left"),
-    JointAssignment("lower_arm_right_rotation", "lower_arm_rotation", "right"),
+    JointAssignment("elbow_left", "elbow", "left", offset=_ELBOW_OFFSET),
+    JointAssignment("elbow_right", "elbow", "right", offset=_ELBOW_OFFSET),
+    JointAssignment(
+        "shoulder_vertical_left",
+        "shoulder_vertical",
+        "left",
+        offset=_SHOULDER_VERTICAL_OFFSET,
+    ),
+    JointAssignment(
+        "shoulder_vertical_right",
+        "shoulder_vertical",
+        "right",
+        offset=_SHOULDER_VERTICAL_OFFSET,
+    ),
+    JointAssignment(
+        "shoulder_horizontal_left",
+        "shoulder_horizontal",
+        "left",
+        offset=_SHOULDER_HORIZONTAL_OFFSET,
+    ),
+    JointAssignment(
+        "shoulder_horizontal_right",
+        "shoulder_horizontal",
+        "right",
+        offset=_SHOULDER_HORIZONTAL_OFFSET,
+    ),
+    JointAssignment(
+        "upper_arm_left_rotation",
+        "upper_arm_rotation",
+        "left",
+        offset=_UPPER_ARM_ROTATION_OFFSET,
+        # Deliberately no forward-only min_deg default anymore - min_deg/
+        # max_deg are now user-set absolute target limits (see mapping
+        # table), which the user can set empirically for their own camera
+        # setup instead of a code guess baked in ahead of time.
+    ),
+    JointAssignment(
+        "upper_arm_right_rotation",
+        "upper_arm_rotation",
+        "right",
+        offset=_UPPER_ARM_ROTATION_OFFSET,
+    ),
+    JointAssignment(
+        "lower_arm_left_rotation",
+        "lower_arm_rotation",
+        "left",
+        offset=_LOWER_ARM_ROTATION_OFFSET,
+    ),
+    JointAssignment(
+        "lower_arm_right_rotation",
+        "lower_arm_rotation",
+        "right",
+        offset=_LOWER_ARM_ROTATION_OFFSET,
+    ),
+    # All finger motors of a side share the one hand_openness candidate -
+    # the "Hand links/rechts" table row drives them together (open/close).
+    JointAssignment(
+        "index_left_stretch", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "index_right_stretch", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "middle_left_stretch", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "middle_right_stretch", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "ring_left_stretch", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "ring_right_stretch", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "pinky_left_stretch", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "pinky_right_stretch", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "thumb_left_stretch", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "thumb_right_stretch", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "thumb_left_opposition", "hand_openness", "left", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
+    JointAssignment(
+        "thumb_right_opposition", "hand_openness", "right", scale=_HAND_SCALE, offset=_HAND_OFFSET
+    ),
 ]
 
 # all motor names this module can produce targets for (for UIs and clients)
@@ -307,11 +474,18 @@ MOTOR_TO_CANDIDATE = {jm.motor_name: jm.candidate_key for jm in DEFAULT_ASSIGNME
 
 def apply_assignment_overrides(overrides: list) -> list:
     """
-    overrides: list of dicts with motor_name/source_side/invert (as returned
-    by motion_capture_mapping_client.get_joint_mapping()). Returns a full
-    JointAssignment list: DEFAULT_ASSIGNMENT with any matching entries'
-    source_side/invert replaced. Unknown motor names in `overrides` are
-    ignored (e.g. a stale row from a previous mapping version).
+    overrides: list of dicts with motor_name/source_side/invert/
+    candidate_low_deg/candidate_high_deg/min_deg/max_deg/speed_percent (as
+    returned by motion_capture_mapping_client.get_joint_mapping()). Returns
+    a full JointAssignment list: DEFAULT_ASSIGNMENT with any matching
+    entries' fields replaced. Unknown motor names in `overrides` are
+    ignored (e.g. a stale row from a previous mapping version). scale/
+    offset are NOT overridable directly here - they're recomputed from
+    candidate_low_deg/candidate_high_deg once both are set (see
+    gesture_capture.py's _with_two_point_calibration), or for arm/shoulder
+    motors kept in sync with the live resting pose as a pre-calibration
+    fallback (_with_rest_pose_offsets); for hand motors pre-calibration
+    it's a deliberate saturation constant (see _HAND_OFFSET above).
     """
     by_motor = {o["motor_name"]: o for o in overrides or []}
     result = []
@@ -320,14 +494,27 @@ def apply_assignment_overrides(overrides: list) -> list:
         if override is None:
             result.append(default)
             continue
+        # dataclasses.replace() rather than reconstructing by hand, so
+        # fields the mapping table doesn't cover (offset, ...) always carry
+        # over from the default instead of silently resetting whenever a
+        # new field is added here. dict.get() only falls back to the
+        # default when the KEY is missing entirely - a stored None (e.g.
+        # "not yet calibrated", or an intentional "no limit") is returned
+        # as-is.
         result.append(
-            JointAssignment(
-                motor_name=default.motor_name,
-                candidate_key=default.candidate_key,
+            replace(
+                default,
                 source_side=override.get("source_side", default.source_side),
                 invert=bool(override.get("invert", default.invert)),
-                scale=default.scale,
-                offset=default.offset,
+                candidate_low_deg=override.get(
+                    "candidate_low_deg", default.candidate_low_deg
+                ),
+                candidate_high_deg=override.get(
+                    "candidate_high_deg", default.candidate_high_deg
+                ),
+                min_deg=override.get("min_deg", default.min_deg),
+                max_deg=override.get("max_deg", default.max_deg),
+                speed_percent=override.get("speed_percent", default.speed_percent),
             )
         )
     return result
@@ -356,5 +543,12 @@ def retarget(payload: dict, assignment: list = None) -> dict:
             continue
         if jm.invert:
             deg = -deg
-        targets[jm.motor_name] = int(round(jm.offset + jm.scale * deg))
+        target = jm.offset + jm.scale * deg
+        # min_deg/max_deg are absolute target limits in MOTOR DEGREES,
+        # applied after calibration - convert to centidegrees to compare.
+        if jm.min_deg is not None:
+            target = max(jm.min_deg * 100.0, target)
+        if jm.max_deg is not None:
+            target = min(jm.max_deg * 100.0, target)
+        targets[jm.motor_name] = int(round(target))
     return targets

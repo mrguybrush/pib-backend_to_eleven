@@ -22,6 +22,11 @@ def replace_all_mappings(
             motor_name=dto["motor_name"],
             source_side=dto["source_side"],
             invert=dto["invert"],
+            candidate_low_deg=dto.get("candidate_low_deg"),
+            candidate_high_deg=dto.get("candidate_high_deg"),
+            min_deg=dto.get("min_deg"),
+            max_deg=dto.get("max_deg"),
+            speed_percent=dto.get("speed_percent", 100.0),
         )
         for dto in mapping_dtos
     ]

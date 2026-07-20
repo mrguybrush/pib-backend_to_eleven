@@ -27,20 +27,48 @@ Safety notes (see plan, "Sicherheit - besonders kritisch"):
   unverified until tested together, arm power supervised, per the plan.
 """
 import time
+from dataclasses import replace
 
 from datatypes.srv import ApplyJointTrajectory
-from pib_api_client import motor_client, motion_capture_mapping_client
+from pib_api_client import (
+    motor_client,
+    motion_capture_mapping_client,
+    motion_capture_settings_client,
+    pose_client,
+)
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from . import retargeting
 
+# Same pose motors/relay_control.py parks the robot in on power on/off (see
+# pib_motors/resting_pose.py) - reused here so a retargeted arm's "0 candidate
+# degrees" (arms hanging, palms in) always lines up with the CURRENT resting
+# pose instead of a stale hardcoded snapshot. Read-only here: unlike
+# apply_resting_pose(), this never commands a motor, only reads positions to
+# use as JointAssignment.offset values.
+RESTING_POSE_NAME = "Startup/Resting"
+
+# candidate_keys whose JointAssignment.offset is a deliberate saturation
+# constant (retargeting.py's _HAND_OFFSET), not a rest-pose calibration -
+# excluded from the live resting-pose offset override, see
+# _with_rest_pose_offsets.
+_HAND_CANDIDATE_KEYS = {"hand_openness"}
+
 SAMPLE_PERIOD_S = 0.1  # 10 Hz, per user-specified capture resolution
 # Max position change per 10Hz tick, in CENTIDEGREES (motor positions and
-# rotation ranges are centidegrees, -9000..9000 = -90..+90 deg). 250 per
-# tick = 25 deg/s - fast enough to visibly follow, slow enough to be safe.
-# (The old value of 4.0 dated from when positions were assumed to be plain
-# degrees; in centidegrees it meant 0.4 deg/s, i.e. visually nothing moved.)
-MAX_STEP_PER_TICK = 250.0
+# rotation ranges are centidegrees, -9000..9000 = -90..+90 deg). 450 per
+# tick = 45 deg/s - user asked for faster/more fluid movement twice now
+# (started at 25 deg/s, then 35); still safety-bounded. (The old value of
+# 4.0 dated from when positions were assumed to be plain degrees; in
+# centidegrees it meant 0.4 deg/s, i.e. visually nothing moved.)
+MAX_STEP_PER_TICK = 450.0
+# Default EMA factor if the motion_capture_settings singleton can't be read.
+# The live value (self.smoothing_alpha) comes from that settings row via the
+# "Glaettung"-Regler above the mapping table - lower = smoother but laggier,
+# higher = snappier/more direct. Applied to raw retarget targets before
+# clamping/rate-limiting (independent of MAX_STEP_PER_TICK, which only
+# bounds speed, not noise).
+DEFAULT_SMOOTHING_ALPHA = 0.4
 
 
 class GestureCapture:
@@ -88,11 +116,27 @@ class GestureCapture:
         # as clamp_ranges - a mapping saved in the wizard should apply on
         # the next activation without requiring a node restart.
         self.assignment = retargeting.DEFAULT_ASSIGNMENT
+        # Cached by _load_assignment() - {motor_name: position_centideg}
+        # from the live "Startup/Resting" pose, reused to seed
+        # last_targets/smoothed_targets on (re)start so the very first
+        # commanded target ramps from the resting pose instead of jumping
+        # (see start()/start_mirroring()).
+        self.rest_pose_offsets = {}
+        # {motor_name: percent (0-100)} - populated alongside assignment,
+        # used by _clamp_and_rate_limit to scale MAX_STEP_PER_TICK per motor.
+        self.speed_percent = {}
+        # EMA factor for _smooth(); refreshed from the motion_capture_settings
+        # singleton on every start/reload (see _load_assignment).
+        self.smoothing_alpha = DEFAULT_SMOOTHING_ALPHA
         self.mode = None
         self.start_time = None
         self.end_time = None
         self.last_sample_time = 0.0
         self.last_targets = {}
+        # EMA-smoothed retarget targets (centidegrees), keyed by motor name -
+        # separate from last_targets, which holds the post-clamp/rate-limit
+        # value actually applied to the motor.
+        self.smoothed_targets = {}
         self.clamp_ranges = {}
         self.frames = []
         self.result = None  # set once a capture finishes; consumed+cleared by GestureControlNode
@@ -107,7 +151,13 @@ class GestureCapture:
         # the calibrated mapping may have changed since the last session.
         self.clamp_ranges = self._load_clamp_ranges()
         self.assignment = self._load_assignment()
-        self.last_targets = {}
+        # Seed with the live resting pose (not {}) - if motor power was
+        # just switched on, relay_control.py parks the robot there right
+        # before powering the servos, so the first rate-limited/smoothed
+        # target ramps up from rest instead of an unbounded jump (see
+        # _clamp_and_rate_limit: no "previous" means no rate limit at all).
+        self.last_targets = dict(self.rest_pose_offsets)
+        self.smoothed_targets = dict(self.rest_pose_offsets)
         self.mirroring = True
         self.node.get_logger().info(
             "live mirroring ON - "
@@ -147,10 +197,12 @@ class GestureCapture:
         self.start_time = time.monotonic()
         self.end_time = self.start_time + duration_s
         self.last_sample_time = 0.0
-        self.last_targets = {}
         self.frames = []
         self.clamp_ranges = self._load_clamp_ranges()
         self.assignment = self._load_assignment()
+        # seed from resting pose, same reasoning as start_mirroring()
+        self.last_targets = dict(self.rest_pose_offsets)
+        self.smoothed_targets = dict(self.rest_pose_offsets)
         self.node.get_logger().info(
             f"gesture capture started: mode={mode} duration={duration_s}s "
             f"motors_with_known_range={list(self.clamp_ranges.keys())}"
@@ -172,8 +224,8 @@ class GestureCapture:
         # calibration wizard displays the raw per-side candidates.
         if landmarks:
             self.latest_candidates = retargeting.compute_candidates(landmarks)
-            self.latest_raw_targets = retargeting.retarget(
-                landmarks, assignment=self.assignment
+            self.latest_raw_targets = self._smooth(
+                retargeting.retarget(landmarks, assignment=self.assignment)
             )
         else:
             self.latest_candidates = {}
@@ -209,22 +261,143 @@ class GestureCapture:
         if now >= self.end_time:
             self._finish()
 
+    def _smooth(self, raw_targets: dict) -> dict:
+        """EMA-smooths raw (unclamped) retarget targets per motor, to reduce
+        pose-estimation jitter before MAX_STEP_PER_TICK's rate limit runs on
+        top. Motors missing this frame keep no stale smoothed state (dropped
+        below), so they re-initialize cleanly once observed again instead of
+        gliding in from an old value."""
+        smoothed = {}
+        for motor_name, target in raw_targets.items():
+            previous = self.smoothed_targets.get(motor_name)
+            value = (
+                target
+                if previous is None
+                else previous + self.smoothing_alpha * (target - previous)
+            )
+            smoothed[motor_name] = value
+        self.smoothed_targets = smoothed
+        return smoothed
+
     def _load_assignment(self):
         successful, dtos = motion_capture_mapping_client.get_joint_mapping()
         if not successful:
             self.node.get_logger().warn(
                 "could not load joint mapping from pib-api; using defaults"
             )
-            return retargeting.DEFAULT_ASSIGNMENT
-        overrides = [
-            {
-                "motor_name": dto["motorName"],
-                "source_side": dto["sourceSide"],
-                "invert": dto["invert"],
-            }
-            for dto in dtos
-        ]
-        return retargeting.apply_assignment_overrides(overrides)
+            assignment = retargeting.DEFAULT_ASSIGNMENT
+        else:
+            overrides = [
+                {
+                    "motor_name": dto["motorName"],
+                    "source_side": dto["sourceSide"],
+                    "invert": dto["invert"],
+                    "candidate_low_deg": dto.get("candidateLowDeg"),
+                    "candidate_high_deg": dto.get("candidateHighDeg"),
+                    "min_deg": dto.get("minDeg"),
+                    "max_deg": dto.get("maxDeg"),
+                    "speed_percent": dto.get("speedPercent"),
+                }
+                for dto in dtos
+            ]
+            assignment = retargeting.apply_assignment_overrides(overrides)
+        # cached on self so start()/start_mirroring() can reuse the same
+        # fetch to seed last_targets/smoothed_targets - see _with_rest_pose_offsets.
+        self.rest_pose_offsets = self._load_rest_pose_offsets()
+        assignment = self._with_rest_pose_offsets(assignment, self.rest_pose_offsets)
+        assignment = self._with_two_point_calibration(assignment)
+        self.speed_percent = {
+            jm.motor_name: jm.speed_percent for jm in assignment
+        }
+        self._load_smoothing_alpha()
+        return assignment
+
+    def _load_smoothing_alpha(self):
+        """Refreshes self.smoothing_alpha from the motion_capture_settings
+        singleton (the "Glaettung"-Regler above the mapping table). Keeps the
+        previous/default value if the settings can't be read."""
+        successful, settings = motion_capture_settings_client.get_settings()
+        if successful and settings and settings.get("smoothingAlpha") is not None:
+            try:
+                self.smoothing_alpha = float(settings["smoothingAlpha"])
+            except (TypeError, ValueError):
+                pass
+
+    def _with_two_point_calibration(self, assignment: list) -> list:
+        """Recomputes scale/offset for any JointAssignment whose
+        candidate_low_deg/candidate_high_deg are both set (via the "Ist-Wert"
+        buttons in the mapping table for the joint's "low"/"high" physical
+        extremes), so candidate_low_deg maps exactly onto this motor's own
+        rotation_range_min and candidate_high_deg onto rotation_range_max -
+        the full servo span, no manual scale tuning. Runs AFTER
+        _with_rest_pose_offsets, so an explicit two-point calibration always
+        takes priority over the generic resting-pose-based fallback offset."""
+        patched = []
+        for jm in assignment:
+            if jm.candidate_low_deg is None or jm.candidate_high_deg is None:
+                patched.append(jm)
+                continue
+            # retarget() negates the raw candidate first when invert=True -
+            # apply the same transform to the calibration anchors here, so
+            # a saved calibration stays correct if invert is toggled later.
+            low = -jm.candidate_low_deg if jm.invert else jm.candidate_low_deg
+            high = -jm.candidate_high_deg if jm.invert else jm.candidate_high_deg
+            span = high - low
+            lo_hi = self.clamp_ranges.get(jm.motor_name)
+            if abs(span) < 1e-6 or lo_hi is None:
+                patched.append(jm)
+                continue
+            lo, hi = lo_hi
+            scale = (hi - lo) / span
+            offset = lo - scale * low
+            patched.append(replace(jm, scale=scale, offset=offset))
+        return patched
+
+    def _load_rest_pose_offsets(self) -> dict:
+        """Reads the live RESTING_POSE_NAME pose's motor positions from the
+        pib-api - the same pose relay_control.py parks the robot in on power
+        on/off, editable by the user on the Poses page. Returns {} (i.e. the
+        hardcoded fallback offsets baked into retargeting.py's
+        DEFAULT_ASSIGNMENT apply) if the pose can't be loaded."""
+        successful, pose = pose_client.get_pose_by_name(RESTING_POSE_NAME)
+        if not successful or pose is None:
+            self.node.get_logger().warn(
+                f"could not find pose '{RESTING_POSE_NAME}'; "
+                "falling back to retargeting.py's baked-in rest offsets"
+            )
+            return {}
+        successful, motor_positions = pose_client.get_motor_positions_of_pose(
+            pose["poseId"]
+        )
+        if not successful or motor_positions is None:
+            self.node.get_logger().warn(
+                f"could not load motor positions of pose '{RESTING_POSE_NAME}'; "
+                "falling back to retargeting.py's baked-in rest offsets"
+            )
+            return {}
+        return {
+            mp["motorName"]: mp["position"]
+            for mp in motor_positions["motorPositions"]
+        }
+
+    def _with_rest_pose_offsets(self, assignment: list, rest_offsets: dict) -> list:
+        """Overrides each arm/shoulder JointAssignment's offset with its
+        live resting-pose position, so a candidate angle of 0 (arms hanging,
+        palms in) always retargets to the robot's CURRENT rest pose instead
+        of the value it happened to have when this code was written. Hand
+        motors are left untouched - their offset is a deliberate saturation
+        constant (see retargeting.py's _HAND_OFFSET), not a rest-pose
+        calibration, and re-purposing it here would blow past the finger
+        motors' real range."""
+        if not rest_offsets:
+            return assignment
+        patched = []
+        for jm in assignment:
+            if jm.candidate_key in _HAND_CANDIDATE_KEYS or jm.motor_name not in rest_offsets:
+                patched.append(jm)
+                continue
+            patched.append(replace(jm, offset=float(rest_offsets[jm.motor_name])))
+        return patched
 
     def _load_clamp_ranges(self):
         ranges = {}
@@ -252,8 +425,11 @@ class GestureCapture:
             previous = self.last_targets.get(motor_name)
             if previous is not None:
                 delta = target - previous
-                if abs(delta) > MAX_STEP_PER_TICK:
-                    target = previous + MAX_STEP_PER_TICK * (1 if delta > 0 else -1)
+                max_step = MAX_STEP_PER_TICK * (
+                    self.speed_percent.get(motor_name, 100.0) / 100.0
+                )
+                if abs(delta) > max_step:
+                    target = previous + max_step * (1 if delta > 0 else -1)
             clamped[motor_name] = int(round(target))
         return clamped
 

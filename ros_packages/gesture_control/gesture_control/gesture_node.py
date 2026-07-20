@@ -18,6 +18,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from .depth_fusion import DepthFusion
 from .gesture_capture import GestureCapture
 
 TICK_PERIOD_S = 0.1  # 10 Hz, matches gesture_capture.SAMPLE_PERIOD_S
@@ -33,6 +34,13 @@ class GestureControlNode(Node):
 
         self.landmarks_subscription = self.create_subscription(
             String, "browser_pose_landmarks", self.on_landmarks, 10
+        )
+        # Echtes Stereo-Tiefenbild der OAK-D (nur waehrend Motion Capture
+        # aktiv, siehe depth_fusion.py) - ersetzt die vom Browser-Modell nur
+        # geschaetzte z-Koordinate durch Messwerte.
+        self.depth_fusion = DepthFusion()
+        self.depth_map_subscription = self.create_subscription(
+            String, "depth_map", self.on_depth_map, 10
         )
         self.gesture_capture_control_subscription = self.create_subscription(
             String, "gesture_capture_control", self.on_capture_control, 10
@@ -63,6 +71,9 @@ class GestureControlNode(Node):
         except json.JSONDecodeError:
             self.get_logger().error(f"invalid browser_pose_landmarks payload: {msg.data}")
 
+    def on_depth_map(self, msg: String):
+        self.depth_fusion.update(msg.data)
+
     def on_capture_control(self, msg: String):
         try:
             command = json.loads(msg.data)
@@ -91,7 +102,13 @@ class GestureControlNode(Node):
 
     def on_timer(self):
         fresh = (time.monotonic() - self.latest_landmarks_time) < LANDMARKS_STALE_AFTER_S
-        self.gesture_capture.tick(self.latest_landmarks if fresh else None)
+        payload = self.latest_landmarks if fresh else None
+        if payload is not None:
+            # Mit frischem Tiefenbild werden die 2D-Landmarks in echte
+            # metrische 3D-Punkte umgerechnet; ohne geht die Payload
+            # unveraendert durch (siehe depth_fusion.py).
+            payload = self.depth_fusion.fuse(payload)
+        self.gesture_capture.tick(payload)
 
         targets_msg = String()
         targets_msg.data = json.dumps(

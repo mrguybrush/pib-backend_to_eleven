@@ -24,3 +24,18 @@ class MotionCaptureJointMapping(db.Model):
     motor_name = db.Column(db.String(255), nullable=False, unique=True)
     source_side = db.Column(db.String(10), nullable=False, default="left")
     invert = db.Column(db.Boolean, nullable=False, default=False)
+    # Zwei-Punkt-Kalibrierung (siehe retargeting.JointAssignment): die rohen
+    # Kamera-Ablesungen bei Gelenk "unten"/"oben" (per "Ist-Wert"-Button in
+    # der Tabelle gesetzt) werden linear auf die volle physische Spanne des
+    # Servos (motor.rotation_range_min/max) abgebildet. NULL = noch nicht
+    # kalibriert, Code-Default aus retargeting.DEFAULT_ASSIGNMENT gilt.
+    candidate_low_deg = db.Column(db.Float, nullable=True)
+    candidate_high_deg = db.Column(db.Float, nullable=True)
+    # Manuelle ABSOLUTE Ziel-Grenze (Motor-Grad, nach der Kalibrierung
+    # angewendet) - um den vollen Servo-Bereich bei Bedarf einzudaemmen.
+    # NULL = keine zusaetzliche Begrenzung (voller Servo-Bereich gilt).
+    min_deg = db.Column(db.Float, nullable=True)
+    max_deg = db.Column(db.Float, nullable=True)
+    # Bewegungsgeschwindigkeit dieses Gelenks in Prozent (0-100) des
+    # globalen Tempolimits (siehe gesture_capture.MAX_STEP_PER_TICK).
+    speed_percent = db.Column(db.Float, nullable=False, default=100.0)
