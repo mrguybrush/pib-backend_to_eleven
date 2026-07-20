@@ -49,6 +49,7 @@ user_program_env/
 password.env
 
 pibdata.db
+pibdata_old.db
 
 host_ip.txt
 
