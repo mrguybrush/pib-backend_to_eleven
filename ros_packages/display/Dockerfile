@@ -14,7 +14,11 @@ WORKDIR /app
 RUN apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y python3-pip && \
     pip install requests==2.32.3 && \
-    pip install pillow
+    pip install pillow && \
+    pip install qrcode
+
+COPY ./pib_api/client ./client
+RUN pip install ./client
 
 COPY ./ros_packages/datatypes ros2_ws/datatypes
 COPY ./ros_packages/display ros2_ws/display

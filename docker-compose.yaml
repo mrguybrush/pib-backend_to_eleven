@@ -27,10 +27,12 @@ services:
       - SQLALCHEMY_DATABASE_URI=sqlite:////app/pibdata.db
       - PIB_BLOCKLY_SERVER_URL=http://pib-blockly-server:2442
       - VOICE_RECORDINGS_DIR=/data/voice_recordings
+      - FACIAL_EXPRESSIONS_DIR=/data/facial_expressions
     volumes:
       - ./pib_api/flask/:/app
       - programs:/root/cerebra_programs
       - /home/pib/voice_recordings:/data/voice_recordings
+      - /home/pib/custom_facial_expressions:/data/facial_expressions
       # Read/write access to the Docker daemon - ONLY used to restart the
       # ros-motors container from the Pinbelegung settings page (it caches
       # the pin/motor wiring in memory at startup, so a pin reassignment
@@ -241,8 +243,11 @@ services:
     environment:
       - STATIC_IMAGE_DIR=/app/ros2_ws/display/static_images
       - DISPLAY=:0.0
+      - FLASK_API_BASE_URL=http://flask-app:5000
     command: ros2 launch display launch.py
     restart: always
+    depends_on:
+      - flask-app
     networks:
       - pib-network
 

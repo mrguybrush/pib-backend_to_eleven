@@ -18,11 +18,18 @@ size). So "using the full width" is about how much of THIS canvas the eyes
 occupy, not a display setting - the eyes below span ~88% of the canvas
 width, matching the size of the original neutral animation's eyes.
 """
+import math
 from PIL import Image, ImageDraw
 
 WIDTH, HEIGHT = 1000, 750
 EYE_COLOR = (28, 156, 217)
 ANGRY_COLOR = (217, 60, 40)
+HEART_COLOR = (230, 40, 90)
+STAR_COLOR = (250, 200, 30)
+# Deutlich heller als reines Schwarz - eine "coole" Sonnenbrille in fast
+# derselben Farbe wie der Hintergrund war auf dem Display quasi unsichtbar.
+COOL_COLOR = (45, 48, 62)
+COOL_HIGHLIGHT_COLOR = (140, 150, 175)
 BG = (0, 0, 0)
 STROKE = 60  # ring thickness
 CX_L, CX_R = 260, 740  # eye centers - spans ~88% of the canvas width
@@ -118,6 +125,95 @@ def sleepy_frame():
     return im
 
 
+def _heart(d, cx, cy, s, color):
+    """filled heart shape centered at (cx, cy) - two round lobes on top and
+    a long triangle beneath tapering to a sharp point.
+
+    The lobes must genuinely OVERLAP (lobe_dx < r by a healthy margin) - an
+    earlier version had them merely touching (lobe_dx == r), which looked
+    right in a small preview but left a visible triangular hole between the
+    lobes on the real display (rasterization doesn't render a hairline
+    tangent as solid). The polygon's top edge sits a little ABOVE the
+    lobes' own notch point (their circle-circle intersection) as extra
+    safety margin against anti-aliasing slivers there."""
+    r = s * 0.42
+    lobe_dx = r * 0.65
+    lobe_cy = cy - s * 0.42
+    for sign in (-1, 1):
+        lcx = cx + sign * lobe_dx
+        d.ellipse([lcx - r, lobe_cy - r, lcx + r, lobe_cy + r], fill=color)
+    notch_y = lobe_cy - math.sqrt(max(r * r - lobe_dx * lobe_dx, 0))
+    base_y = notch_y - s * 0.03
+    base_half_width = lobe_dx + r * 0.98
+    d.polygon(
+        [
+            (cx - base_half_width, base_y),
+            (cx + base_half_width, base_y),
+            (cx, cy + s * 1.2),
+        ],
+        fill=color,
+    )
+
+
+def heart_frame():
+    """classic "in love" eyes: filled pink/red hearts instead of pupils"""
+    im, d = _canvas()
+    for cx in (CX_L, CX_R):
+        _heart(d, cx, CY, RX * 0.95, HEART_COLOR)
+    return im
+
+
+def _star_points(cx, cy, outer_r, inner_r, points=5, rotation_deg=-90):
+    """vertices of a 5-pointed star, alternating outer/inner radius"""
+    pts = []
+    step = math.pi / points
+    start = math.radians(rotation_deg)
+    for i in range(points * 2):
+        r = outer_r if i % 2 == 0 else inner_r
+        angle = start + i * step
+        pts.append((cx + r * math.cos(angle), cy + r * math.sin(angle)))
+    return pts
+
+
+def star_frame():
+    """starstruck/amazed eyes: filled yellow stars instead of pupils"""
+    im, d = _canvas()
+    for cx in (CX_L, CX_R):
+        pts = _star_points(cx, CY, RX * 0.95, RX * 0.42)
+        d.polygon(pts, fill=STAR_COLOR)
+    return im
+
+
+def cool_frame():
+    """sunglasses: two dark rounded-rect lenses joined by a bridge, each with
+    a small glint highlight so the lenses actually stand out against the
+    black canvas (a near-black fill on black was invisible on the display)."""
+    im, d = _canvas()
+    lens_w, lens_h = RX * 1.3, RY * 0.75
+    for cx in (CX_L, CX_R):
+        d.rounded_rectangle(
+            [cx - lens_w / 2, CY - lens_h / 2, cx + lens_w / 2, CY + lens_h / 2],
+            radius=28,
+            fill=COOL_COLOR,
+        )
+        gx, gy = cx - lens_w * 0.22, CY - lens_h * 0.22
+        gw, gh = lens_w * 0.22, lens_h * 0.22
+        d.ellipse(
+            [gx - gw / 2, gy - gh / 2, gx + gw / 2, gy + gh / 2],
+            fill=COOL_HIGHLIGHT_COLOR,
+        )
+    _line(d, (CX_L + lens_w / 2, CY), (CX_R - lens_w / 2, CY), color=COOL_COLOR, width=18)
+    return im
+
+
+def wink_frame():
+    """one eye happy (smiling arc), the other closed - a playful wink"""
+    im, d = _canvas()
+    _arc(d, CX_L, CY + 100, _MAX_WIDE_RX, RY, 180, 360)
+    _line(d, (CX_R - RX, CY), (CX_R + RX, CY))
+    return im
+
+
 def save_gif(name, open_frame, blink_color=EYE_COLOR):
     frames = [open_frame, closed_frame(blink_color), open_frame.copy()]
     durations = [OPEN_MS, BLINK_MS, OPEN_MS]
@@ -137,3 +233,7 @@ if __name__ == "__main__":
     save_gif("pib-eyes-angry.gif", angry_frame(), blink_color=ANGRY_COLOR)
     save_gif("pib-eyes-surprised.gif", surprised_frame())
     save_gif("pib-eyes-sleepy.gif", sleepy_frame())
+    save_gif("pib-eyes-heart.gif", heart_frame(), blink_color=HEART_COLOR)
+    save_gif("pib-eyes-star.gif", star_frame(), blink_color=STAR_COLOR)
+    save_gif("pib-eyes-cool.gif", cool_frame(), blink_color=COOL_COLOR)
+    save_gif("pib-eyes-wink.gif", wink_frame())

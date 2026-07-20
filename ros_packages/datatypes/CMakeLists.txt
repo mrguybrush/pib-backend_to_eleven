@@ -12,6 +12,7 @@ find_package(trajectory_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
 	"msg/MotorSettings.msg"
+	"msg/MovementSettings.msg"
 	"msg/ChatMessage.msg"
 	"msg/VoiceAssistantState.msg"
 	"msg/ProgramOutputLine.msg"
@@ -22,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"msg/ProgramInput.msg"
 	"msg/ChatIsListening.msg"
 	"srv/ApplyMotorSettings.srv"
+	"srv/ApplyMovementSettings.srv"
 	"msg/ImageId.msg"
 	"msg/ImageFormat.msg"
 	"msg/DisplayImage.msg"

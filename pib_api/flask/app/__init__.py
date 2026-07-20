@@ -16,8 +16,12 @@ from controller import (
     gesture_controller,
     movement_sequence_controller,
     motion_capture_joint_mapping_controller,
+    motion_capture_settings_controller,
     voice_recording_controller,
     learning_group_controller,
+    system_settings_controller,
+    movement_settings_controller,
+    facial_expression_controller,
 )
 
 app.register_blueprint(program_controller.bp, url_prefix="/program", name="program")
@@ -69,6 +73,11 @@ app.register_blueprint(
     name="joint-mapping",
 )
 app.register_blueprint(
+    motion_capture_settings_controller.bp,
+    url_prefix="/gesture-control/settings",
+    name="motion-capture-settings",
+)
+app.register_blueprint(
     voice_recording_controller.bp,
     url_prefix="/voice-recordings",
     name="voice-recordings",
@@ -77,4 +86,19 @@ app.register_blueprint(
     learning_group_controller.bp,
     url_prefix="/learning-groups",
     name="learning-groups",
+)
+app.register_blueprint(
+    system_settings_controller.bp,
+    url_prefix="/system-settings",
+    name="system-settings",
+)
+app.register_blueprint(
+    movement_settings_controller.bp,
+    url_prefix="/movement-settings",
+    name="movement-settings",
+)
+app.register_blueprint(
+    facial_expression_controller.bp,
+    url_prefix="/facial-expressions",
+    name="facial-expressions",
 )

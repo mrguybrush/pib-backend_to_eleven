@@ -4,22 +4,51 @@ from dataclasses import dataclass
 from io import BytesIO
 from itertools import cycle
 import os
-from threading import Thread
+import time
+from threading import Thread, Timer
 from typing import Iterable, Iterator, Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from std_msgs.msg import String, Empty
 import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageFont
+import PIL.ImageTk
+import qrcode
 
 from tkinter import *
 
 from datatypes.msg import DisplayImage, ImageFormat, ImageId
+from pib_api_client import ip_client
 
 import os
 
 os.environ.setdefault("DISPLAY", ":0.0")
+
+# how long the IP-address overlay stays up at boot before switching to the
+# normal eyes animation - long enough to read+type it, short enough to not
+# be stuck showing it if nobody's looking.
+IP_OVERLAY_SECONDS = 20.0
+
+# Kameraspiegel waehrend der Bewegungserfassung: solange Motion Capture
+# laeuft (Signal: oak_depth_control "start"/"stop", dasselbe Topic, mit dem
+# die Motion-Capture-Seite den Tiefenstream schaltet), zeigt das Display
+# statt der Augen das Kamerabild - die Person vor pib sieht sich dann
+# direkt am Roboter, ohne auf den Browser schauen zu muessen. Gespiegelt
+# wie ein echter Spiegel (sonst fuehlt sich links/rechts falsch an).
+CAMERA_MIRROR_MAX_FPS = 5.0
+_CAMERA_MIRROR_MIN_INTERVAL_S = 1.0 / CAMERA_MIRROR_MAX_FPS
+# JPEG-Qualitaet fuers erneute Encoden nach dem Spiegeln - Display ist
+# klein, 70 reicht locker und haelt die Frames leicht.
+_CAMERA_MIRROR_JPEG_QUALITY = 70
+# host-ip endpoint may not be reachable yet if flask-app is still doing its
+# own startup (db migrations/seed) - retry a few times rather than silently
+# skipping the overlay on a slow boot.
+IP_FETCH_ATTEMPTS = 5
+IP_FETCH_RETRY_DELAY_S = 2.0
 
 
 # points to the directory, where all static images are
@@ -133,8 +162,12 @@ class Animation:
                 resized.save(data_buffer, "gif")
                 # extract data from buffer and encode bytes as base64
                 data = base64.b64encode(data_buffer.getvalue())
-                # get the duration of the current frame
-                duration_ms = image.info["duration"]
+                # get the duration of the current frame - falls back to a
+                # sensible hold time if the gif doesn't specify one (common
+                # for a simple single-frame/static gif exported by hand,
+                # e.g. from an image editor, rather than generated with
+                # explicit per-frame durations like the other emotions here)
+                duration_ms = image.info.get("duration", 2000)
                 # yield the extracted data
                 queue.put((data, duration_ms))
             # 'None' -> all frames were processed
@@ -162,13 +195,108 @@ IMAGE_ID_TO_STATIC_IMAGES: dict[int, ImageFile] = {
     ImageId.PIB_EYES_SLEEPY: ImageFile(
         ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-sleepy.gif"
     ),
+    ImageId.PIB_EYES_HEART: ImageFile(
+        ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-heart.gif"
+    ),
+    ImageId.PIB_EYES_STAR: ImageFile(
+        ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-star.gif"
+    ),
+    ImageId.PIB_EYES_COOL: ImageFile(
+        ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-cool.gif"
+    ),
+    ImageId.PIB_EYES_WINK: ImageFile(
+        ImageFormat.ANIMATED_GIF, STATIC_IMAGE_DIR + "/pib-eyes-wink.gif"
+    ),
 }
 
-FORMAT_VALUE_TO_STR: dict[int, str] = {
-    ImageFormat.ANIMATED_GIF: "gif",
-    ImageFormat.PNG: "png",
-    ImageFormat.JPEG: "jpeg",
-}
+# Matches pib-eyes-animated.gif's resolution/aspect ratio as a stand-in for
+# the real screen's aspect ratio (GuiApplication resizes any image to the
+# actual screen size regardless, but keeping the same aspect avoids
+# unnecessary stretching/distortion).
+_IP_OVERLAY_SIZE = (1000, 750)
+# PIL.ImageFont.load_default() only accepts a 'size' kwarg (for a legible
+# scalable font) from Pillow >= 10.1, not guaranteed in whatever the image
+# happens to pull at build time. Instead: draw with the small built-in
+# bitmap font on a canvas this many times smaller, then nearest-neighbor
+# upscale the whole image - guarantees big, crisp (if blocky) text on any
+# Pillow version, no bundled font file needed.
+_IP_OVERLAY_UPSCALE = 4
+
+
+def _centered_text(
+    draw: "PIL.ImageDraw.ImageDraw",
+    text: str,
+    canvas_width: int,
+    y: float,
+    font,
+    fill,
+) -> None:
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    draw.text(((canvas_width - text_width) / 2, y), text, font=font, fill=fill)
+
+
+def _generate_qr_code_image(data: str, size_px: int) -> "PIL.Image.Image":
+    """Renders 'data' as a QR code, scaled to a size_px x size_px square.
+    Nearest-neighbor scaling keeps the module edges sharp (same reasoning
+    as _IP_OVERLAY_UPSCALE above - blurring a QR code risks it not
+    scanning)."""
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(data)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    return image.resize((size_px, size_px), PIL.Image.NEAREST)
+
+
+def _render_ip_overlay_png(ip: str) -> bytes:
+    """Renders an 'IP-Adresse: x.x.x.x' image with a QR code linking to
+    pib's web interface, shown at boot so the user can find pib on the
+    network without a laptop already connected - or just scan the code
+    with their phone."""
+    width, height = _IP_OVERLAY_SIZE
+    small_w, small_h = width // _IP_OVERLAY_UPSCALE, height // _IP_OVERLAY_UPSCALE
+    small = PIL.Image.new("RGB", (small_w, small_h), color=(10, 12, 26))
+    draw = PIL.ImageDraw.Draw(small)
+    font = PIL.ImageFont.load_default()
+
+    _centered_text(draw, "IP-Adresse", small_w, small_h * 0.08, font, (150, 155, 180))
+    _centered_text(draw, ip, small_w, small_h * 0.20, font, (255, 255, 255))
+
+    image = small.resize((width, height), PIL.Image.NEAREST)
+
+    qr_size = int(height * 0.55)
+    qr_x = (width - qr_size) // 2
+    qr_y = int(height * 0.35)
+    qr_image = _generate_qr_code_image(f"http://{ip}/", qr_size)
+    # weisser Rahmen, damit der QR-Code auf dem dunklen Hintergrund sauber
+    # scannbar bleibt (ohne Rahmen wuerde der dunkle Hintergrund direkt an
+    # die aeusseren hellen QR-Module angrenzen).
+    quiet_zone = 12
+    PIL.ImageDraw.Draw(image).rectangle(
+        [
+            qr_x - quiet_zone,
+            qr_y - quiet_zone,
+            qr_x + qr_size + quiet_zone,
+            qr_y + qr_size + quiet_zone,
+        ],
+        fill=(255, 255, 255),
+    )
+    image.paste(qr_image, (qr_x, qr_y))
+
+    buffer = BytesIO()
+    image.save(buffer, "png")
+    return buffer.getvalue()
+
+
+def _fetch_host_ip(log) -> Optional[str]:
+    for attempt in range(IP_FETCH_ATTEMPTS):
+        successful, ip = ip_client.get_host_ip()
+        if successful and ip:
+            return ip
+        if attempt < IP_FETCH_ATTEMPTS - 1:
+            time.sleep(IP_FETCH_RETRY_DELAY_S)
+    log("could not fetch host IP for the startup overlay after retrying")
+    return None
 
 
 class GuiApplication(Frame):
@@ -231,15 +359,16 @@ class GuiApplication(Frame):
         self._show_next_frame(animation)
 
     def _show_static_image(self, raw_image: RawImage) -> None:
-        format_str = FORMAT_VALUE_TO_STR[raw_image.format_value]
         with PIL.Image.open(BytesIO(raw_image.data)) as image:
             resized = image.resize((self._width, self._height))
-            # buffer for storing binary data of image
-            data_buffer = BytesIO()
-            # save the current frame in the data-buffer
-            resized.save(data_buffer, format_str)
-            data = base64.b64encode(data_buffer.getvalue())
-        self.current_main_content = PhotoImage(data=data, format=format_str)
+            # tkinter.PhotoImage only understands GIF/PGM/PPM/PNG - it can't
+            # decode JPEG (used by the camera-mirror feature, see
+            # on_camera_frame), which raised _tkinter.TclError here and left
+            # the canvas blank/white (already cleared in _show_image() right
+            # before this ran). PIL.ImageTk.PhotoImage renders directly from
+            # the already-decoded PIL image instead, so it works for any
+            # format PIL can open.
+            self.current_main_content = PIL.ImageTk.PhotoImage(resized)
         self.canvas.create_image(0, 0, image=self.current_main_content, anchor="nw")
 
     def _show_next_frame(self, animation: Animation) -> None:
@@ -284,9 +413,68 @@ class DisplayNode(Node):
         pib_eyes_animated = RawImage.from_image_file(
             IMAGE_ID_TO_STATIC_IMAGES[ImageId.PIB_EYES_ANIMATED]
         )
-        self.image_queue.put(pib_eyes_animated)
+
+        # --- Kameraspiegel (siehe Kommentar bei CAMERA_MIRROR_MAX_FPS) ---
+        self.pib_eyes_animated = pib_eyes_animated
+        self.camera_mirror_active = False
+        self._last_mirror_time = 0.0
+        self.create_subscription(
+            String, "oak_depth_control", self.on_motion_capture_control, 10
+        )
+        self.create_subscription(
+            String, "camera_topic", self.on_camera_frame, 1
+        )
+
+        # Auf Anfrage (z.B. Klick auf den QR-Code im Frontend) das IP+QR-
+        # Overlay zeigen - Empty-Message, keine eigenen Datentypen noetig.
+        self.create_subscription(
+            Empty, "show_ip_overlay", self.on_show_ip_overlay, 10
+        )
+        self._ip_overlay_revert_timer: Optional[Timer] = None
+
+        startup_image = self._build_ip_overlay_image() or pib_eyes_animated
+        self.image_queue.put(startup_image)
+
+        if startup_image is not pib_eyes_animated:
+            # boot notice only - revert to the normal eyes animation once
+            # it's had its time on screen. If a "real" image has been
+            # requested via the display_image topic in the meantime, this
+            # will interrupt it once; acceptable for a one-shot boot notice.
+            self._revert_to_eyes_after(IP_OVERLAY_SECONDS)
 
         self.get_logger().info("Now Running DISPLAY")
+
+    def _build_ip_overlay_image(self) -> Optional[RawImage]:
+        """Fetches the host IP and renders the 'IP-Adresse + QR-Code'
+        overlay, or None if the IP can't be determined / rendering fails."""
+        ip = _fetch_host_ip(self.get_logger().warn)
+        if not ip:
+            return None
+        try:
+            return RawImage(ImageFormat.PNG, _render_ip_overlay_png(ip))
+        except Exception:
+            self.get_logger().exception("failed to render IP overlay image")
+            return None
+
+    def _revert_to_eyes_after(self, seconds: float) -> None:
+        """(Re)starts the timer that puts the animated eyes back on screen
+        after the IP/QR overlay has had its time up."""
+        if self._ip_overlay_revert_timer is not None:
+            self._ip_overlay_revert_timer.cancel()
+        self._ip_overlay_revert_timer = Timer(
+            seconds, lambda: self.image_queue.put(self.pib_eyes_animated)
+        )
+        self._ip_overlay_revert_timer.start()
+
+    def on_show_ip_overlay(self, _msg: Empty) -> None:
+        """Show the IP+QR overlay now (same duration as at boot), then revert
+        to the eyes - triggered by the frontend when the user opens the QR
+        code, so the code is scannable straight off pib's own screen."""
+        overlay = self._build_ip_overlay_image()
+        if overlay is None:
+            return
+        self.image_queue.put(overlay)
+        self._revert_to_eyes_after(IP_OVERLAY_SECONDS)
 
     def on_display_image_received(self, display_image: DisplayImage):
         """callback function for the 'display_image'-topic subscriber"""
@@ -296,6 +484,54 @@ class DisplayNode(Node):
         except Exception as e:
             self.get_logger().error(f"error while showing image from topic: {e}.")
 
+    def on_motion_capture_control(self, msg: String):
+        """Motion Capture an/aus (oak_depth_control) -> Kameraspiegel
+        an/aus; beim Beenden zurueck zu den animierten Augen."""
+        active = msg.data.strip().lower() == "start"
+        if active == self.camera_mirror_active:
+            return
+        self.camera_mirror_active = active
+        self.get_logger().info(f"camera mirror: active={active}")
+        if not active:
+            # blockierend (nicht droppend): die Augen-Wiederherstellung darf
+            # nicht verloren gehen, sonst bliebe das letzte Kamerabild
+            # stehen. Die GUI leert die Queue binnen ~160ms, und neue
+            # Kamera-Frames kommen nicht mehr (mirror_active ist schon False).
+            self.image_queue.put(self.pib_eyes_animated)
+
+    def on_camera_frame(self, msg: String):
+        """Kamera-Frame (base64-JPEG vom Kamera-Node) auf dem Display
+        zeigen, solange Motion Capture laeuft - gedrosselt und horizontal
+        gespiegelt (wie ein Spiegel)."""
+        if not self.camera_mirror_active:
+            return
+        now = time.monotonic()
+        if now - self._last_mirror_time < _CAMERA_MIRROR_MIN_INTERVAL_S:
+            return
+        self._last_mirror_time = now
+        try:
+            jpeg = base64.b64decode(msg.data)
+            with PIL.Image.open(BytesIO(jpeg)) as image:
+                mirrored = image.transpose(PIL.Image.FLIP_LEFT_RIGHT)
+                buffer = BytesIO()
+                mirrored.save(
+                    buffer, "jpeg", quality=_CAMERA_MIRROR_JPEG_QUALITY
+                )
+            self._queue_image_dropping(
+                RawImage(ImageFormat.JPEG, buffer.getvalue())
+            )
+        except Exception as e:
+            self.get_logger().error(f"camera mirror frame failed: {e}")
+
+    def _queue_image_dropping(self, image: RawImage) -> None:
+        """Bild anzeigen, aber NIE blockieren: die GUI-Queue hat maxsize=1 -
+        ist sie gerade voll, wird der Frame einfach verworfen (beim
+        naechsten Kamera-Frame kommt ohnehin ein aktuellerer)."""
+        try:
+            self.image_queue.put_nowait(image)
+        except Exception:
+            pass
+
 
 def run_gui_application(image_queue: Queue[RawImage | None]) -> None:
     while True:
@@ -304,6 +540,14 @@ def run_gui_application(image_queue: Queue[RawImage | None]) -> None:
             continue
         root = Tk()
         root.bind("<Escape>", lambda _: root.destroy())
+        # Requesting fullscreen before the window manager has mapped this
+        # window is a race: the WM sometimes misses/ignores the fullscreen
+        # hint, leaving the taskbar and window border visible on top ("manchmal
+        # sieht man oben noch die Taskleiste und den Fensterrand" - only
+        # happens once per boot, since the window is reused for every image
+        # afterwards). Forcing the window to be realized first gives the WM
+        # an actual window to apply the hint to.
+        root.update_idletasks()
         root.attributes("-fullscreen", True)
         width = root.winfo_screenwidth()
         height = root.winfo_screenheight()
