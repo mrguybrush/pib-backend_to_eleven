@@ -1,5 +1,6 @@
 from queue import Queue
 import base64
+import gc
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import cycle
@@ -352,6 +353,22 @@ class GuiApplication(Frame):
         self.canvas.delete("all")
         if isinstance(self.current_main_content, Animation):
             self.current_main_content.stop()
+        # Dropping the last reference to the old Animation/PhotoImage frames
+        # here doesn't guarantee they're actually freed on THIS thread - if
+        # they're part of a reference cycle (the frame generator is a bound
+        # method closing over 'self'), cleanup gets deferred to Python's
+        # cyclic GC, which can run on ANY thread that happens to allocate
+        # next (e.g. the new Animation's background frame-loader thread).
+        # PhotoImage.__del__ calls into Tcl, which aborts the whole process
+        # if invoked off the Tk main thread ("Tcl_AsyncDelete: async handler
+        # deleted by the wrong thread") - reproducible simply by switching
+        # the displayed image while a previous animation is still running.
+        # Forcing a synchronous collect() HERE, while we're definitely still
+        # on the Tk main thread (this method only runs from Tk callbacks),
+        # ensures that cleanup happens now instead of being deferred to an
+        # unsafe thread later.
+        self.current_main_content = None
+        gc.collect()
         if raw_image.format_value == ImageFormat.ANIMATED_GIF:
             self._show_animated_gif(raw_image)
         else:
