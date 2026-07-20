@@ -437,12 +437,17 @@ if is_supported_raspbian; then
   disable_power_notification || print ERROR "failed to disable power notifications"
 fi
 
-install_system_packages || { print ERROR "failed to install system packages"; return 1; }
-install_locale || { print ERROR "failed to install locale"; return 1; }
-clone_repositories || { print ERROR "failed to clone repositories"; return 1; }
+install_system_packages || { print ERROR "failed to install system packages"; exit 1; }
+install_locale || { print ERROR "failed to install locale"; exit 1; }
+clone_repositories || { print ERROR "failed to clone repositories"; exit 1; }
 install_imitation || print ERROR "failed to install imitation project"
 if is_supported_raspbian && [ "$DIST_VERSION" = "trixie" ]; then
-  source "$SETUP_INSTALLATION_DIR/ros_jazzy_install.sh" || { print ERROR "failed to install ROS 2 Jazzy"; return 1; }
+  # Non-fatal: this only builds an OPTIONAL native ROS 2 Jazzy overlay so the
+  # host CLI can inspect ROS nodes running inside the Docker containers (see
+  # ros_jazzy_install.sh) - Cerebra/pib-backend themselves run entirely via
+  # Docker (docker_install.sh below) and don't need this overlay, so a
+  # failure here must not block them.
+  source "$SETUP_INSTALLATION_DIR/ros_jazzy_install.sh" || print ERROR "failed to install ROS 2 Jazzy (native host overlay) - continuing without it, Cerebra runs via Docker regardless"
 fi
 move_setup_files || print ERROR "failed to move setup files"
 install_DBbrowser || print ERROR "failed to install DB browser"
@@ -456,7 +461,7 @@ if [ "$INSTALL_METHOD" = "legacy" ]; then
 elif is_ubuntu_noble || is_supported_raspbian; then
   print INFO "Going to install Cerebra via Docker"
   source "$SETUP_INSTALLATION_DIR/docker_install.sh" || print ERROR "failed to install Cerebra via Docker"
-  sudo usermod -aG docker pib || { print ERROR "failed to add user 'pib' to docker group"; return 1; }
+  sudo usermod -aG docker pib || { print ERROR "failed to add user 'pib' to docker group"; exit 1; }
 fi
 cleanup
 
