@@ -21,7 +21,11 @@ import qrcode
 
 from tkinter import *
 
+import requests
+
 from datatypes.msg import DisplayImage, ImageFormat, ImageId
+from datatypes.srv import ShowCustomFacialExpression
+from pib_api_client import URL_PREFIX
 from pib_api_client import ip_client
 
 import os
@@ -432,6 +436,18 @@ class DisplayNode(Node):
         )
         self._ip_overlay_revert_timer: Optional[Timer] = None
 
+        # Zeigt einen benutzerdefinierten Gesichtsausdruck (siehe
+        # Verwaltungsseite "Gesichtsausdruecke") anhand seiner expression_id -
+        # fuer Blockly-generierte Programme, die (anders als das Frontend)
+        # nicht selbst per HTTP die GIF-Bytes holen und ueber ROS publishen
+        # koennen. Holt die Bytes hier direkt von Flask und zeigt sie genauso
+        # an wie ImageId.CUSTOM (siehe RawImage.from_display_image).
+        self.create_service(
+            ShowCustomFacialExpression,
+            "show_custom_facial_expression",
+            self.on_show_custom_facial_expression,
+        )
+
         startup_image = self._build_ip_overlay_image() or pib_eyes_animated
         self.image_queue.put(startup_image)
 
@@ -483,6 +499,27 @@ class DisplayNode(Node):
             self.image_queue.put(raw_image)
         except Exception as e:
             self.get_logger().error(f"error while showing image from topic: {e}.")
+
+    def on_show_custom_facial_expression(
+        self,
+        request: ShowCustomFacialExpression.Request,
+        response: ShowCustomFacialExpression.Response,
+    ) -> ShowCustomFacialExpression.Response:
+        try:
+            reply = requests.get(
+                f"{URL_PREFIX}/facial-expressions/{request.expression_id}/gif",
+                timeout=5,
+            )
+            reply.raise_for_status()
+            self.image_queue.put(RawImage(ImageFormat.ANIMATED_GIF, reply.content))
+            response.successful = True
+        except Exception as e:
+            self.get_logger().error(
+                f"error while showing custom facial expression "
+                f"'{request.expression_id}': {e}."
+            )
+            response.successful = False
+        return response
 
     def on_motion_capture_control(self, msg: String):
         """Motion Capture an/aus (oak_depth_control) -> Kameraspiegel

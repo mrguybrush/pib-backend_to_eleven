@@ -19,6 +19,7 @@ def create_personality(personality_dto: Any) -> List[Personality]:
         message_history=personality_dto["message_history"],
         assistant_model_id=personality_dto["assistant_model_id"],
         camera_access_enabled=personality_dto.get("camera_access_enabled", False),
+        movement_access_enabled=personality_dto.get("movement_access_enabled", False),
     )
     db.session.add(personality)
     db.session.flush()
@@ -35,6 +36,8 @@ def update_personality(personality_id: str, personality_dto: Any) -> Personality
         personality.description = personality_dto["description"]
     if "camera_access_enabled" in personality_dto:
         personality.camera_access_enabled = personality_dto["camera_access_enabled"]
+    if "movement_access_enabled" in personality_dto:
+        personality.movement_access_enabled = personality_dto["movement_access_enabled"]
     personality.assistant_model_id = personality_dto["assistant_model_id"]
     db.session.flush()
     return personality
