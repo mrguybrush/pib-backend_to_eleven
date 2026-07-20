@@ -1,10 +1,15 @@
 from typing import Iterable, Tuple
 import rclpy
-from datatypes.msg import MotorSettings
-from datatypes.srv import ApplyMotorSettings, ApplyJointTrajectory, GetJointPosition
-from pib_api_client import motor_client
+from datatypes.msg import MotorSettings, MovementSettings
+from datatypes.srv import (
+    ApplyMotorSettings,
+    ApplyMovementSettings,
+    ApplyJointTrajectory,
+    GetJointPosition,
+)
+from pib_api_client import motor_client, movement_settings_client
 from pib_motors.bricklet import ipcon, connected_enumerate
-from pib_motors.motor import name_to_motors, motors
+from pib_motors.motor import Motor, name_to_motors, motors
 from pib_motors.resting_pose import apply_resting_pose
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -70,6 +75,15 @@ class MotorControl(Node):
             ApplyMotorSettings, "apply_motor_settings", self.apply_motor_settings
         )
 
+        # Service for the global movement-speed (see pib_motors.motor.Motor.
+        # movement_speed_percent) - one setting for all motors, unlike
+        # ApplyMotorSettings above which targets a single motor.
+        self.srv_movement_settings = self.create_service(
+            ApplyMovementSettings,
+            "apply_movement_settings",
+            self.apply_movement_settings,
+        )
+
         # Service for Getting Joint Position
         self.srv_get_position = self.create_service(
             GetJointPosition, "get_joint_position", self.get_joint_position
@@ -79,6 +93,17 @@ class MotorControl(Node):
         self.motor_settings_publisher = self.create_publisher(
             MotorSettings, "motor_settings", 10
         )
+
+        # Publisher for the global MovementSettings
+        self.movement_settings_publisher = self.create_publisher(
+            MovementSettings, "movement_settings", 10
+        )
+
+        # Load the global movement-speed (doesn't need connected hardware,
+        # so this runs in dev-mode too, unlike the per-motor settings below).
+        successful, movement_settings_dto = movement_settings_client.get_settings()
+        if successful:
+            Motor.set_movement_speed_percent(movement_settings_dto["speedPercent"])
 
         # Load motor settings exactly as stored (incl. turnedOn), then
         # pre-position everything at the resting pose. The servos are
@@ -136,6 +161,39 @@ class MotorControl(Node):
             response.settings_persisted = False
             self.get_logger().warn(
                 f"Error while processing motor-settings-message: {str(e)}"
+            )
+
+        return response
+
+    def apply_movement_settings(
+        self,
+        request: ApplyMovementSettings.Request,
+        response: ApplyMovementSettings.Response,
+    ) -> ApplyMovementSettings.Response:
+
+        response.settings_applied = True
+        response.settings_persisted = True
+
+        speed_percent = request.movement_settings.speed_percent
+
+        try:
+            Motor.set_movement_speed_percent(speed_percent)
+            # The pib-api schema is camelCase on the wire (like all motor
+            # settings) - sending snake_case "speed_percent" here made the
+            # PUT fail with 400, so the value never persisted and every
+            # restart reset the speed to 100%.
+            persisted, _ = movement_settings_client.update_settings(
+                {"speedPercent": speed_percent}
+            )
+            response.settings_persisted = persisted
+            self.movement_settings_publisher.publish(request.movement_settings)
+            self.get_logger().info(f"updated global movement speed: {speed_percent}%")
+
+        except Exception as e:
+            response.settings_applied = False
+            response.settings_persisted = False
+            self.get_logger().warn(
+                f"Error while processing movement-settings-message: {str(e)}"
             )
 
         return response
