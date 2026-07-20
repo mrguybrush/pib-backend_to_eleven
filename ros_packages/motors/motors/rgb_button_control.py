@@ -112,6 +112,17 @@ class RGBButtonControl(Node):
                 self.stop_program(running_goal_id, uid)
                 return
 
+            # Stop programs started by OTHER buttons first - otherwise the
+            # new program runs in parallel with the old one and the motions
+            # mix ("wenn ein anderer Button gedrueckt wird muss zuerst das
+            # laufende Programm unterbrochen werden").
+            for goal_id, goal_uid in list(self.goal_to_uid.items()):
+                self.get_logger().info(
+                    f"Stopping program of button {goal_uid} before starting "
+                    f"button {uid}'s program."
+                )
+                self.stop_program(goal_id, goal_uid)
+
             self.load_button_programs()
             program_number = self.uid_to_program.get(uid)
             if program_number:

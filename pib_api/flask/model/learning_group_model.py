@@ -23,8 +23,8 @@ class LearningGroup(db.Model):
 
 class AppSettings(db.Model):
     """
-    Globale App-Einstellungen (Singleton, id=1) - aktuell nur die aktive
-    Lerngruppe. Analog zu VoiceSettings/LlmSettings als eigene
+    Globale App-Einstellungen (Singleton, id=1) - aktive Lerngruppe und
+    Auto-Off-Zeit. Analog zu VoiceSettings/LlmSettings als eigene
     Einzeiler-Tabelle gehalten.
     """
 
@@ -34,3 +34,20 @@ class AppSettings(db.Model):
     active_learning_group_id = db.Column(
         db.Integer, db.ForeignKey("learning_group.id"), nullable=True
     )
+    # Minuten ohne Bewegung, nach denen der Roboter automatisch in die
+    # Resting Pose faehrt und den Motorstrom abschaltet. NULL = deaktiviert.
+    auto_off_minutes = db.Column(db.Integer, nullable=True)
+
+    # Sichtbarkeit der Hauptmenuepunkte in der linken Navigation (True =
+    # ausgeblendet). Ausgeblendete Seiten bleiben ueber die direkte URL
+    # erreichbar, es fehlt nur der Link.
+    hide_joint_control_nav = db.Column(db.Boolean, nullable=False, default=False)
+    hide_pose_nav = db.Column(db.Boolean, nullable=False, default=False)
+    hide_camera_nav = db.Column(db.Boolean, nullable=False, default=False)
+    # Bewegungserfassung ist experimentell und per Default ausgeblendet -
+    # einschaltbar unter Einstellungen > Menuepunkte.
+    hide_motion_capture_nav = db.Column(db.Boolean, nullable=False, default=True)
+    hide_voice_recording_nav = db.Column(db.Boolean, nullable=False, default=False)
+    hide_voice_assistant_nav = db.Column(db.Boolean, nullable=False, default=False)
+    hide_program_nav = db.Column(db.Boolean, nullable=False, default=False)
+    hide_system_nav = db.Column(db.Boolean, nullable=False, default=False)

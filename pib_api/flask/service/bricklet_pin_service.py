@@ -1,12 +1,11 @@
 from typing import Optional
 
-import docker
-
 from app.app import db
 from model.bricklet_model import Bricklet
 from model.bricklet_pin_model import BrickletPin
 from model.defective_pin_model import DefectivePin
 from model.motor_model import Motor
+from service.container_control_service import restart_service_container
 
 # Tinkerforge Servo Bricklet 2.0: 10 servo ports, numbered 0-9.
 PINS_PER_SERVO_BRICKLET = 10
@@ -114,13 +113,5 @@ def set_pin_defective(bricklet_id: int, pin: int, defective: bool) -> None:
 def restart_motors_container() -> None:
     """Restarts the ros-motors container so it re-reads the pin/motor
     wiring (and motor settings) from the DB - it only loads that once at
-    startup. Needs /var/run/docker.sock mounted into this container (see
-    docker-compose.yaml); the API only ever exposes this one specific
-    action, never arbitrary container control."""
-    client = docker.from_env()
-    containers = client.containers.list(
-        filters={"label": f"com.docker.compose.service={ROS_MOTORS_SERVICE_NAME}"}
-    )
-    if not containers:
-        raise ValueError(f"Container für Service '{ROS_MOTORS_SERVICE_NAME}' nicht gefunden.")
-    containers[0].restart(timeout=10)
+    startup."""
+    restart_service_container(ROS_MOTORS_SERVICE_NAME)

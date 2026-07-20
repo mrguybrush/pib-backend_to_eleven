@@ -1,4 +1,6 @@
 import os
+import subprocess
+import tempfile
 import wave
 from datetime import datetime, timezone
 
@@ -56,22 +58,38 @@ def upload_voice_recording():
         return jsonify({"error": "no file provided (field name 'file')"}), 400
     file = request.files["file"]
 
-    filename = secure_filename(file.filename or "")
-    if not filename.lower().endswith(".wav"):
-        return jsonify({"error": "only .wav files are accepted"}), 400
+    original_name = secure_filename(file.filename or "")
+    is_mp3 = original_name.lower().endswith(".mp3")
+    if not is_mp3 and not original_name.lower().endswith(".wav"):
+        return jsonify({"error": "only .wav or .mp3 files are accepted"}), 400
+
+    # MP3-Uploads werden nach WAV gewandelt (siehe unten) - Wiedergabe (ROS +
+    # der "Play WAV"-Blockly-Block) liest ausschliesslich WAV-Dateien aus
+    # diesem Ordner.
+    stem = os.path.splitext(original_name)[0]
+    filename = f"{stem}.wav"
 
     # avoid overwriting an existing recording silently
     path = os.path.join(VOICE_RECORDINGS_DIR, filename)
     if os.path.exists(path):
-        stem, ext = os.path.splitext(filename)
         for i in range(2, 1000):
-            candidate = f"{stem} ({i}){ext}"
+            candidate = f"{stem} ({i}).wav"
             candidate_path = os.path.join(VOICE_RECORDINGS_DIR, candidate)
             if not os.path.exists(candidate_path):
                 filename, path = candidate, candidate_path
                 break
 
-    file.save(path)
+    if is_mp3:
+        with tempfile.NamedTemporaryFile(suffix=".mp3") as tmp:
+            file.save(tmp.name)
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp.name, path],
+                capture_output=True,
+            )
+        if result.returncode != 0:
+            return jsonify({"error": "MP3 konnte nicht umgewandelt werden."}), 400
+    else:
+        file.save(path)
 
     # reject anything that isn't actually a playable WAV file (the ROS
     # service that plays these back uses python's 'wave' module, which can
@@ -82,7 +100,7 @@ def upload_voice_recording():
             pass
     except Exception as e:
         os.remove(path)
-        return jsonify({"error": f"not a valid WAV file: {e}"}), 400
+        return jsonify({"error": f"not a valid audio file: {e}"}), 400
 
     return jsonify({"filename": filename}), 201
 

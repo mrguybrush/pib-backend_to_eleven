@@ -12,6 +12,9 @@ class Pose(db.Model):
     )
     name = db.Column(db.String(255), nullable=False, unique=True)
     deletable = db.Column(db.Boolean, nullable=False, default=True)
+    # Drag&Drop-Reihenfolge in der Posen-Liste; NULL = noch nie einsortiert
+    # (faellt ans Listenende, siehe pose_service.get_all_poses)
+    sort_index = db.Column(db.Integer, nullable=True)
     # None = not assigned to any learning group; non-deletable poses
     # (Startup/Resting) are always shown regardless of the active group
     learning_group_id = db.Column(

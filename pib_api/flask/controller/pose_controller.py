@@ -29,6 +29,15 @@ def get_all_poses():
     return jsonify({"poses": poses_schema.dump(poses)})
 
 
+@bp.route("/order", methods=["PUT"])
+def reorder_poses():
+    """Persistiert die Drag&Drop-Reihenfolge der Posen-Liste.
+    Body: {"poseIds": ["<uuid>", ...]} in gewuenschter Anzeige-Reihenfolge."""
+    pose_ids = (request.json or {}).get("poseIds", [])
+    pose_service.reorder_poses(pose_ids)
+    return "", 204
+
+
 @bp.route("/by-name/<path:name>", methods=["GET"])
 def get_pose_by_name(name: str):
     pose = pose_service.get_pose_by_name(name)

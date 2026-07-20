@@ -12,7 +12,8 @@ from service import learning_group_service
 def get_all_poses() -> List[Pose]:
     """With an active learning group: only that group's poses plus the
     non-deletable default poses (Startup/Resting stays always available).
-    Without one: everything."""
+    Without one: everything. Ordered by the user's drag&drop sort_index
+    (NULL = never sorted, falls to the end, then by name)."""
     active_group_id = learning_group_service.active_group_db_id()
     query = Pose.query
     if active_group_id is not None:
@@ -22,7 +23,22 @@ def get_all_poses() -> List[Pose]:
                 Pose.deletable == False,  # noqa: E712 (SQLAlchemy expression)
             )
         )
-    return query.order_by(Pose.deletable.asc()).all()
+    return query.order_by(
+        Pose.deletable.asc(),
+        db.func.coalesce(Pose.sort_index, 1_000_000).asc(),
+        Pose.name.asc(),
+    ).all()
+
+
+def reorder_poses(pose_ids: List[str]) -> None:
+    """Persists the drag&drop order of the pose list: sort_index = position
+    in the given list. Poses not in the list keep their old index (they were
+    filtered out client-side, e.g. by the active learning group)."""
+    index_by_id = {pose_id: index for index, pose_id in enumerate(pose_ids)}
+    poses = Pose.query.filter(Pose.pose_id.in_(pose_ids)).all()
+    for pose in poses:
+        pose.sort_index = index_by_id[pose.pose_id]
+    db.session.flush()
 
 
 def get_all_poses_admin() -> List[dict]:

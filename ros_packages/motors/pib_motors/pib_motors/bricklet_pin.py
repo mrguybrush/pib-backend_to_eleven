@@ -46,18 +46,35 @@ class BrickletPin:
             self.bricklet.set_pulse_width(
                 self.pin, settings_dto["pulseWidthMin"], settings_dto["pulseWidthMax"]
             )
-            self.bricklet.set_motion_configuration(
-                self.pin,
-                settings_dto["velocity"],
-                settings_dto["acceleration"],
-                settings_dto["deceleration"],
-            )
+            self.set_motion_configuration(settings_dto)
             self.bricklet.set_period(self.pin, settings_dto["period"])
             self.bricklet.set_enable(self.pin, settings_dto["turnedOn"])
             return True
         except Exception as error:
             logging.error(
                 f"error occured while trying to apply motor-settings: {str(error)}"
+            )
+        return False
+
+    def set_motion_configuration(self, settings_dto: dict[str, Any]) -> bool:
+        """writes just velocity/acceleration/deceleration to the bricklet -
+        split out from apply_settings() so Motor can re-send these (scaled by
+        the global movement-speed, see Motor._apply_scaled_motion_configuration)
+        before every move, without re-sending pulse-width/period/enable on
+        every single position command."""
+        if not self.is_connected():
+            return False
+        try:
+            self.bricklet.set_motion_configuration(
+                self.pin,
+                settings_dto["velocity"],
+                settings_dto["acceleration"],
+                settings_dto["deceleration"],
+            )
+            return True
+        except Exception as error:
+            logging.error(
+                f"error occured while trying to set motion-configuration: {str(error)}"
             )
         return False
 
