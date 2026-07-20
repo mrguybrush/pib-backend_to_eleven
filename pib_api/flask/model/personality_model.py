@@ -16,6 +16,10 @@ class Personality(db.Model):
     pause_threshold = db.Column(db.Float, nullable=False)
     message_history = db.Column(db.Integer, nullable=False)
     camera_access_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    # Erlaubt der Gemini-Live-Sprachsitzung, den move_joint-Funktionsaufruf zu
+    # nutzen und damit tatsaechlich Motoren zu bewegen (siehe audio_loop.py
+    # MOVE_JOINT_TOOL) - wie camera_access_enabled standardmaessig aus.
+    movement_access_enabled = db.Column(db.Boolean, nullable=False, default=False)
     chats = db.relationship(
         "Chat", backref="personality", lazy=True, cascade="all,delete"
     )

@@ -23,6 +23,7 @@ from pib_api_client import voice_assistant_client
 
 import pyaudio
 from google import genai
+from google.genai import types as genai_types
 
 import wave
 from pathlib import Path
@@ -33,6 +34,13 @@ from asyncio import QueueEmpty
 from datatypes.srv import CreateOrUpdateChatMessage
 # camera stills, only polled when personality.camera_access_enabled is True
 from datatypes.srv import GetCameraImage
+# move_joint tool call, only usable when personality.movement_access_enabled
+# is True - reuses the same ApplyJointTrajectory service the joint-control
+# UI and Blockly programs already go through, so the existing
+# rotation_range_min/max safety clamp (Motor._validate_position) applies
+# here too with no extra code.
+from datatypes.srv import ApplyJointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 import queue
 import time
@@ -59,6 +67,75 @@ CONFIG = {
     "input_audio_transcription": {},  # get user (input) transcript stream
     "output_audio_transcription": {},  # get assistant (output) transcript stream
 }
+# All motor names pib ships with (see pib_api_client.motor_client / the
+# "Alle Gelenke" page) - kept as a plain list here (rather than fetched at
+# runtime) so the tool's enum is available immediately at connect time.
+MOTOR_NAMES = [
+    "turn_head_motor",
+    "tilt_forward_motor",
+    "upper_arm_left_rotation",
+    "elbow_left",
+    "lower_arm_left_rotation",
+    "shoulder_vertical_left",
+    "shoulder_horizontal_left",
+    "upper_arm_right_rotation",
+    "elbow_right",
+    "lower_arm_right_rotation",
+    "shoulder_vertical_right",
+    "shoulder_horizontal_right",
+    "thumb_right_opposition",
+    "thumb_right_stretch",
+    "index_right_stretch",
+    "middle_right_stretch",
+    "ring_right_stretch",
+    "pinky_right_stretch",
+    "thumb_left_opposition",
+    "thumb_left_stretch",
+    "index_left_stretch",
+    "middle_left_stretch",
+    "ring_left_stretch",
+    "pinky_left_stretch",
+    "wrist_left",
+    "wrist_right",
+]
+
+# Gemini Live function-calling tool: lets the model actually move one of
+# pib's motors (only added to the session config when the active
+# personality has movement_access_enabled). "position" is a percentage
+# (-100..100) of that motor's configured rotation range; out-of-range
+# values are silently clamped server-side (Motor._validate_position), so
+# this can never move a joint past its configured min/max.
+MOVE_JOINT_TOOL = {
+    "function_declarations": [
+        {
+            "name": "move_joint",
+            "description": (
+                "Bewegt ein einzelnes Gelenk (Motor) von pib auf eine neue "
+                "Position. position ist ein Prozentwert von -100 bis 100 "
+                "relativ zum eingestellten Bewegungsbereich dieses Motors "
+                "(0 ist meist die Mittelstellung); Werte ausserhalb des "
+                "erlaubten Bereichs werden automatisch auf die Grenze "
+                "begrenzt."
+            ),
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "motor_name": {
+                        "type": "STRING",
+                        "enum": MOTOR_NAMES,
+                        "description": "Name des zu bewegenden Motors.",
+                    },
+                    "position": {
+                        "type": "INTEGER",
+                        "description": "Zielposition in Prozent (-100 bis 100).",
+                    },
+                },
+                "required": ["motor_name", "position"],
+            },
+        }
+    ]
+}
+
 ROS_AUDIO_TOPIC = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
 # how often (seconds) a camera still is polled and sent to Gemini as video
 # input, when the active personality has camera_access_enabled - Gemini Live
@@ -315,6 +392,60 @@ class RosCameraBridge:
             logger.exception("RosCameraBridge crashed")
 
 
+class RosMotorBridge:
+    """Backs the move_joint Gemini function-calling tool: a small, lazily-
+    started ROS node + client for the existing apply_joint_trajectory
+    service (the same one the joint-control UI and Blockly programs use).
+    Only instantiated when the active personality has
+    movement_access_enabled.
+
+    move_joint() blocks on rclpy.spin_until_future_complete, so callers
+    must run it off the asyncio event loop (see receive_audio's
+    run_in_executor call) - same reasoning as RosCameraBridge, but here we
+    call it on-demand per tool call rather than on a polling timer."""
+
+    def __init__(self):
+        self._node: Optional[Node] = None
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _ensure_started(self):
+        with self._lock:
+            if self._node is not None:
+                return
+            if not rclpy.ok():
+                rclpy.init()
+            self._node = Node("gemini_motor_bridge")
+            self._client = self._node.create_client(
+                ApplyJointTrajectory, "apply_joint_trajectory"
+            )
+
+    def move_joint(self, motor_name: str, position: int) -> tuple[bool, str]:
+        """Returns (successful, error_message)."""
+        self._ensure_started()
+        if not self._client.wait_for_service(timeout_sec=3.0):
+            return False, "apply_joint_trajectory service not available"
+
+        jt = JointTrajectory()
+        jt.joint_names = [motor_name]
+        point = JointTrajectoryPoint()
+        point.positions = [float(position)]
+        jt.points = [point]
+
+        request = ApplyJointTrajectory.Request()
+        request.joint_trajectory = jt
+        try:
+            future = self._client.call_async(request)
+            with self._lock:
+                rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
+            if not future.done() or future.result() is None:
+                return False, "timed out waiting for motor response"
+            return bool(future.result().successful), ""
+        except Exception as e:
+            logger.exception("RosMotorBridge: move_joint call failed")
+            return False, str(e)
+
+
 # ——————————————————————————————————————————
 #                Main audio loop
 # ——————————————————————————————————————————
@@ -352,6 +483,9 @@ class GeminiAudioLoop:
         # Camera bridge handle (only started when the personality has
         # camera_access_enabled)
         self._camera_bridge: Optional[RosCameraBridge] = None
+        # Motor bridge handle (only started when the personality has
+        # movement_access_enabled) - backs the move_joint tool call.
+        self._motor_bridge: Optional[RosMotorBridge] = None
 
         # Logging / turns (optional: write input/output wavs)
         self._turn_id = 0
@@ -799,6 +933,68 @@ class GeminiAudioLoop:
 
         return None
 
+    async def _handle_tool_call(self, tool_call: "genai_types.LiveServerToolCall") -> None:
+        """Executes each requested move_joint call via RosMotorBridge (off
+        the event loop, since it blocks on rclpy) and reports the outcome
+        back to Gemini so it knows whether the movement actually happened."""
+        function_responses = []
+        for call in tool_call.function_calls:
+            if call.name != "move_joint" or self._motor_bridge is None:
+                function_responses.append(
+                    genai_types.FunctionResponse(
+                        id=call.id,
+                        name=call.name,
+                        response={"error": "tool not available"},
+                    )
+                )
+                continue
+
+            args = call.args or {}
+            motor_name = args.get("motor_name")
+            position = args.get("position")
+            try:
+                position = int(position)
+            except (TypeError, ValueError):
+                function_responses.append(
+                    genai_types.FunctionResponse(
+                        id=call.id,
+                        name=call.name,
+                        response={"error": f"invalid position: {position!r}"},
+                    )
+                )
+                continue
+
+            if motor_name not in MOTOR_NAMES:
+                function_responses.append(
+                    genai_types.FunctionResponse(
+                        id=call.id,
+                        name=call.name,
+                        response={"error": f"unknown motor_name: {motor_name!r}"},
+                    )
+                )
+                continue
+
+            loop = asyncio.get_running_loop()
+            successful, error = await loop.run_in_executor(
+                None, self._motor_bridge.move_joint, motor_name, position
+            )
+            function_responses.append(
+                genai_types.FunctionResponse(
+                    id=call.id,
+                    name=call.name,
+                    response=(
+                        {"successful": True}
+                        if successful
+                        else {"successful": False, "error": error}
+                    ),
+                )
+            )
+
+        try:
+            await self.session.send_tool_response(function_responses=function_responses)
+        except Exception:
+            logger.exception("Failed to send tool response to Gemini")
+
     async def receive_audio(self):
         """
         Receives downstream events from Gemini:
@@ -851,6 +1047,13 @@ class GeminiAudioLoop:
                             "GoAway received (time_left=%s). Reconnecting...", time_left
                         )
                         raise ReconnectRequested("go_away")
+
+                    # move_joint tool calls (only present when the active
+                    # personality has movement_access_enabled - see run()).
+                    tool_call = getattr(resp, "tool_call", None)
+                    if tool_call is not None and tool_call.function_calls:
+                        await self._handle_tool_call(tool_call)
+
                     # Handle transcripts (user now, assistant buffered)
                     sc = getattr(resp, "server_content", None)
                     if sc is not None:
@@ -972,6 +1175,7 @@ class GeminiAudioLoop:
         # Read chat personality/description from PIB to seed the model (once)
         description = "You are pib, a humanoid robot."
         camera_enabled = False
+        movement_enabled = False
         try:
             successful, personality = voice_assistant_client.get_personality_from_chat(
                 self._chat_id
@@ -984,13 +1188,44 @@ class GeminiAudioLoop:
                 camera_enabled = bool(
                     getattr(personality, "camera_access_enabled", False)
                 )
+                movement_enabled = bool(
+                    getattr(personality, "movement_access_enabled", False)
+                )
         except Exception:
             logger.exception(
                 "Failed to fetch personality; using default system instruction."
             )
 
+        if camera_enabled:
+            # Without this, Gemini has no way of knowing the incoming video
+            # blobs are its own camera feed and defaults to denying it has
+            # any camera access at all.
+            description = (
+                description
+                + "\n\nDu hast eine Kamera und bekommst laufend aktuelle Bilder "
+                "von dem, was gerade vor dir zu sehen ist. Wenn jemand dich "
+                "fragt, was du siehst oder was gerade passiert, beschreibe "
+                "das zuletzt empfangene Kamerabild. Behaupte niemals, dass "
+                "du keinen Kamerazugriff hast."
+            )
+
+        if movement_enabled:
+            # Without this, Gemini has no way of knowing it can actually
+            # move the robot and defaults to claiming it cannot.
+            description = (
+                description
+                + "\n\nDu kannst deinen eigenen Koerper tatsaechlich bewegen: "
+                "ruf dazu move_joint mit einem Motornamen und einer "
+                "Zielposition (-100 bis 100 Prozent) auf. Bewege Gelenke nur "
+                "in kleinen, vorsichtigen Schritten und nur wenn explizit "
+                "danach gefragt wird oder es zur Situation passt. Behaupte "
+                "niemals, dass du dich nicht bewegen kannst."
+            )
+
         base_config = dict(CONFIG)
         base_config["system_instruction"] = description
+        if movement_enabled:
+            base_config["tools"] = [MOVE_JOINT_TOOL]
 
         async def _connect_config():
             connection_config = dict(base_config)
@@ -1058,6 +1293,16 @@ class GeminiAudioLoop:
                             "RosCameraBridge started (camera_access_enabled=True)."
                         )
                         tasks.append(asyncio.create_task(self.send_video_frames()))
+
+                    # Movement is opt-in per personality: the move_joint tool
+                    # call is only usable (and only advertised to Gemini via
+                    # base_config["tools"] above) when movement_access_enabled
+                    # is set on the active personality.
+                    if movement_enabled:
+                        self._motor_bridge = RosMotorBridge()
+                        logger.info(
+                            "RosMotorBridge ready (movement_access_enabled=True)."
+                        )
 
                     # Wait until one task errors (or requests reconnect)
                     done, pending = await asyncio.wait(
