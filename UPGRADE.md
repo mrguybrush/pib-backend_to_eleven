@@ -4,9 +4,9 @@ Es gibt zwei Szenarien: eine **komplett neue SD-Karte** (frische Installation) o
 
 ## Neue SD-Karte (Neuinstallation)
 
-Kein Upgrade nötig — `setup/setup-pib.sh` installiert alles in einem Rutsch: ROS, Docker, udev-Regeln für die Kamera, Tinkerforge-Treiber, und klont beide Repos ([`cerebra_to_eleven`](https://github.com/mrguybrush/cerebra_to_eleven), [`pib-backend_to_eleven`](https://github.com/mrguybrush/pib-backend_to_eleven)) inklusive des [`pib-blockly-mod`](https://github.com/mrguybrush/pib-blockly-mod)-Submoduls.
+Kein Upgrade nötig — `setup/setup-pib.sh` installiert alles in einem Rutsch: ROS, Docker, udev-Regeln für die Kamera, Tinkerforge-Treiber, und klont beide Repos ([`cerebra_to_eleven`](https://github.com/mrguybrush/cerebra_to_eleven), [`pib-backend_to_eleven`](https://github.com/mrguybrush/pib-backend_to_eleven)).
 
-Alle drei Repos sind öffentlich — kein SSH-Deploy-Key oder sonstiges Zugriffs-Setup nötig, ein einfaches `git clone` reicht.
+Beide Repos sind öffentlich — kein SSH-Deploy-Key oder sonstiges Zugriffs-Setup nötig, ein einfaches `git clone` reicht.
 
 ```
 bash setup-pib.sh
@@ -44,19 +44,11 @@ git pull --ff-only origin main
 ```
 Falls `--ff-only` wegen eigener Commits fehlschlägt: `git merge origin/main` (kann Konflikte geben, die von Hand aufgelöst werden müssen).
 
-### 4. Submodul umstellen
-
-`.gitmodules` zeigt jetzt auf die öffentliche `pib-blockly-mod`-URL (kommt automatisch mit dem Pull). Submodul aktualisieren:
-```
-git submodule sync
-git submodule update --init --recursive
-```
-
-### 5. Datenbank-Migrationen
+### 4. Datenbank-Migrationen
 
 Passiert automatisch beim nächsten Container-Build (`flask --app run db upgrade` läuft im Dockerfile). Neue Tabellen werden ergänzt, **bestehende Daten bleiben erhalten**.
 
-### 6. Neu bauen und starten
+### 5. Neu bauen und starten
 
 ```
 cd ~/app/pib-backend
@@ -68,6 +60,6 @@ docker compose -p multirepo build angular-app
 docker compose -p multirepo up -d angular-app
 ```
 
-### 7. Testen
+### 6. Testen
 
 Seite im Inkognito-/Privatfenster öffnen (nginx cached `index.html` sonst clientseitig). Neue Funktionen prüfen: System → „Programme" (Lerngruppen-Zuordnung), Joint Control → „Alle Gelenke" (Finger-Slider, Invert-Häkchen), Sprachassistent-Einstellungen (Gemini-Kamera-/Bewegungszugriff-Schalter), Posen-Seite → „Gesichtsausdrücke verwalten".
