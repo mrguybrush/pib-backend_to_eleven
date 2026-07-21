@@ -17,9 +17,9 @@ Follow these steps to run it:
 
 2. Insert the following command into the terminal to download the script:
 
-        wget https://raw.githubusercontent.com/pib-rocks/pib-backend/main/setup/setup-pib.sh
+        wget https://raw.githubusercontent.com/mrguybrush/pib-backend_to_eleven/main/setup/setup-pib.sh
 
-   (or download it manually: https://github.com/pib-rocks/pib-backend/blob/main/setup/setup-pib.sh)
+   (or download it manually: https://github.com/mrguybrush/pib-backend_to_eleven/blob/main/setup/setup-pib.sh)
 
 3. Insert this command to run the script:
 
