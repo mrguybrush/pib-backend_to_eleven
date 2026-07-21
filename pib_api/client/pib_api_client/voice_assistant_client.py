@@ -33,6 +33,9 @@ class Personality:
         self.movement_access_enabled = personality_dto.get(
             "movementAccessEnabled", False
         )
+        self.emotion_access_enabled = personality_dto.get(
+            "emotionAccessEnabled", False
+        )
         self.assistant_model = self._get_assistant_model(
             personality_dto["assistantModelId"]
         )

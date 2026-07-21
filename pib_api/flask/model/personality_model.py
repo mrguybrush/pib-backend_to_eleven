@@ -20,6 +20,11 @@ class Personality(db.Model):
     # nutzen und damit tatsaechlich Motoren zu bewegen (siehe audio_loop.py
     # MOVE_JOINT_TOOL) - wie camera_access_enabled standardmaessig aus.
     movement_access_enabled = db.Column(db.Boolean, nullable=False, default=False)
+    # Erlaubt der Gemini-Live-Sprachsitzung, den show_emotion-Funktionsaufruf
+    # zu nutzen und damit passend zum Gespraech Gesichtsausdruecke auf pibs
+    # Display zu zeigen (siehe audio_loop.py SHOW_EMOTION_TOOL) - eigener
+    # Schalter, unabhaengig von movement_access_enabled.
+    emotion_access_enabled = db.Column(db.Boolean, nullable=False, default=False)
     chats = db.relationship(
         "Chat", backref="personality", lazy=True, cascade="all,delete"
     )

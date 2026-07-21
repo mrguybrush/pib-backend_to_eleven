@@ -19,7 +19,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import Int16MultiArray
-from pib_api_client import voice_assistant_client
+from pib_api_client import voice_assistant_client, pose_client
 
 import pyaudio
 from google import genai
@@ -40,6 +40,9 @@ from datatypes.srv import GetCameraImage
 # rotation_range_min/max safety clamp (Motor._validate_position) applies
 # here too with no extra code.
 from datatypes.srv import ApplyJointTrajectory
+# show_emotion tool - publishes the same display_image topic the Pose page's
+# emotion buttons and Blockly's set_eyes_emotion block use.
+from datatypes.msg import DisplayImage, ImageId, ImageFormat
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 import queue
@@ -99,23 +102,35 @@ MOTOR_NAMES = [
     "wrist_right",
 ]
 
-# Gemini Live function-calling tool: lets the model actually move one of
-# pib's motors (only added to the session config when the active
-# personality has movement_access_enabled). "position" is a percentage
-# (-100..100) of that motor's configured rotation range; out-of-range
-# values are silently clamped server-side (Motor._validate_position), so
-# this can never move a joint past its configured min/max.
+# Gemini Live function-calling tools: let the model actually move pib's
+# motors (only added to the session config when the active personality has
+# movement_access_enabled).
+#
+# "position" is in DEGREES (matching the same rotation_range_min/max unit
+# every motor is configured in, just /100 for a human/AI-friendly number -
+# the ROS side stores hundredths of a degree). An earlier version described
+# this as "-100 to 100 percent", which the model dutifully used, sending
+# values like 50 - but Motor._validate_position() clamps against the RAW
+# hundredths-of-a-degree range (e.g. -9000..9000), so a "position=50" call
+# only ever moved a joint by half a degree: technically successful,
+# practically imperceptible ("reacts poorly or not at all"). Values outside
+# a joint's configured range are still clamped automatically server-side,
+# so this can never move a joint past its limit - just no longer silently
+# 100x too small.
 MOVE_JOINT_TOOL = {
     "function_declarations": [
         {
             "name": "move_joint",
             "description": (
                 "Bewegt ein einzelnes Gelenk (Motor) von pib auf eine neue "
-                "Position. position ist ein Prozentwert von -100 bis 100 "
-                "relativ zum eingestellten Bewegungsbereich dieses Motors "
-                "(0 ist meist die Mittelstellung); Werte ausserhalb des "
+                "Position. position ist der Zielwinkel in GRAD (nicht "
+                "Prozent!), typischer Bereich je nach Gelenk etwa -90 bis "
+                "90 (0 ist meist die Mittelstellung); Werte ausserhalb des "
                 "erlaubten Bereichs werden automatisch auf die Grenze "
-                "begrenzt."
+                "begrenzt. Fuer eine sichtbare Bewegung reichen kleine "
+                "Aenderungen oft schon nicht aus - im Zweifel eher grosszuegige "
+                "Winkeldifferenzen verwenden (z.B. 30-60 Grad), nicht nur "
+                "wenige Grad."
             ),
             "parameters": {
                 "type": "OBJECT",
@@ -127,10 +142,66 @@ MOVE_JOINT_TOOL = {
                     },
                     "position": {
                         "type": "INTEGER",
-                        "description": "Zielposition in Prozent (-100 bis 100).",
+                        "description": "Zielwinkel in Grad (nicht Prozent).",
                     },
                 },
                 "required": ["motor_name", "position"],
+            },
+        },
+        {
+            "name": "reset_pose",
+            "description": (
+                "Bewegt ALLE Gelenke zurueck in die neutrale Ausgangs-/"
+                "Ruheposition (dieselbe Pose wie beim Hochfahren). Danach "
+                "rufen, wenn eine gezeigte Bewegung/Geste abgeschlossen ist, "
+                "damit pib nicht in einer verdrehten Haltung stehen bleibt."
+            ),
+            "parameters": {"type": "OBJECT", "properties": {}},
+        },
+    ]
+}
+
+# Fixed emotions shown on pib's display (see pose.component.ts's emotions
+# list / display-block.ts's getEmotions - kept in sync manually, "HEART" was
+# removed there too). Deliberately does NOT include user-uploaded custom
+# facial expressions - those have per-install names/ids the model has no
+# stable way to know about ahead of time.
+EMOTION_NAME_TO_IMAGE_ID = {
+    "neutral": ImageId.PIB_EYES_ANIMATED,
+    "happy": ImageId.PIB_EYES_HAPPY,
+    "sad": ImageId.PIB_EYES_SAD,
+    "angry": ImageId.PIB_EYES_ANGRY,
+    "surprised": ImageId.PIB_EYES_SURPRISED,
+    "sleepy": ImageId.PIB_EYES_SLEEPY,
+    "star": ImageId.PIB_EYES_STAR,
+    "cool": ImageId.PIB_EYES_COOL,
+    "wink": ImageId.PIB_EYES_WINK,
+}
+
+# Gemini Live function-calling tool: lets the model show a facial expression
+# on pib's display matching the mood of the conversation (only added when
+# the active personality has emotion_access_enabled - independent of
+# movement_access_enabled).
+SHOW_EMOTION_TOOL = {
+    "function_declarations": [
+        {
+            "name": "show_emotion",
+            "description": (
+                "Zeigt einen Gesichtsausdruck auf pibs Display, passend zur "
+                "Stimmung des Gespraechs (z.B. 'happy' wenn du dich freust, "
+                "'surprised' bei einer ueberraschenden Wendung). 'neutral' "
+                "setzt die normalen, ruhigen Augen zurueck."
+            ),
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "emotion": {
+                        "type": "STRING",
+                        "enum": list(EMOTION_NAME_TO_IMAGE_ID.keys()),
+                        "description": "Welcher Gesichtsausdruck gezeigt werden soll.",
+                    },
+                },
+                "required": ["emotion"],
             },
         }
     ]
@@ -392,15 +463,21 @@ class RosCameraBridge:
             logger.exception("RosCameraBridge crashed")
 
 
-class RosMotorBridge:
-    """Backs the move_joint Gemini function-calling tool: a small, lazily-
-    started ROS node + client for the existing apply_joint_trajectory
-    service (the same one the joint-control UI and Blockly programs use).
-    Only instantiated when the active personality has
-    movement_access_enabled.
+# Same value as pib_api/flask/default_pose_constants.py's STARTUP_POSE_NAME -
+# duplicated here since this container doesn't have the Flask package
+# available, just its HTTP client (pib_api_client.pose_client).
+STARTUP_POSE_NAME = "Startup/Resting"
 
-    move_joint() blocks on rclpy.spin_until_future_complete, so callers
-    must run it off the asyncio event loop (see receive_audio's
+
+class RosMotorBridge:
+    """Backs the move_joint/reset_pose Gemini function-calling tools: a
+    small, lazily-started ROS node + client for the existing
+    apply_joint_trajectory service (the same one the joint-control UI and
+    Blockly programs use). Only instantiated when the active personality
+    has movement_access_enabled.
+
+    move_joint()/reset_pose() block on rclpy.spin_until_future_complete, so
+    callers must run them off the asyncio event loop (see receive_audio's
     run_in_executor call) - same reasoning as RosCameraBridge, but here we
     call it on-demand per tool call rather than on a polling timer."""
 
@@ -420,17 +497,18 @@ class RosMotorBridge:
                 ApplyJointTrajectory, "apply_joint_trajectory"
             )
 
-    def move_joint(self, motor_name: str, position: int) -> tuple[bool, str]:
-        """Returns (successful, error_message)."""
+    def _apply(self, joint_names: list[str], positions: list[float]) -> tuple[bool, str]:
         self._ensure_started()
         if not self._client.wait_for_service(timeout_sec=3.0):
             return False, "apply_joint_trajectory service not available"
 
         jt = JointTrajectory()
-        jt.joint_names = [motor_name]
-        point = JointTrajectoryPoint()
-        point.positions = [float(position)]
-        jt.points = [point]
+        jt.joint_names = joint_names
+        jt.points = []
+        for position in positions:
+            point = JointTrajectoryPoint()
+            point.positions = [position]
+            jt.points.append(point)
 
         request = ApplyJointTrajectory.Request()
         request.joint_trajectory = jt
@@ -442,7 +520,62 @@ class RosMotorBridge:
                 return False, "timed out waiting for motor response"
             return bool(future.result().successful), ""
         except Exception as e:
-            logger.exception("RosMotorBridge: move_joint call failed")
+            logger.exception("RosMotorBridge: apply_joint_trajectory call failed")
+            return False, str(e)
+
+    def move_joint(self, motor_name: str, degrees: int) -> tuple[bool, str]:
+        """Returns (successful, error_message). degrees is converted to the
+        hundredths-of-a-degree unit rotation_range_min/max (and thus
+        ApplyJointTrajectory) actually use."""
+        return self._apply([motor_name], [float(degrees) * 100])
+
+    def reset_pose(self) -> tuple[bool, str]:
+        """Moves every joint back to the Startup/Resting pose."""
+        successful, motor_positions = pose_client.get_pose_by_name(STARTUP_POSE_NAME)
+        if not successful or motor_positions is None:
+            return False, f"could not find pose '{STARTUP_POSE_NAME}'"
+        positions = motor_positions.get("motorPositions", [])
+        if not positions:
+            return False, f"pose '{STARTUP_POSE_NAME}' has no motor positions"
+        joint_names = [p["motorName"] for p in positions]
+        joint_positions = [float(p["position"]) for p in positions]
+        return self._apply(joint_names, joint_positions)
+
+
+class RosEmotionBridge:
+    """Backs the show_emotion Gemini function-calling tool: a small,
+    lazily-started ROS node + publisher for the display_image topic (the
+    same one the Pose page's emotion buttons and Blockly's set_eyes_emotion
+    block publish to). Only instantiated when the active personality has
+    emotion_access_enabled."""
+
+    def __init__(self):
+        self._node: Optional[Node] = None
+        self._publisher = None
+        self._lock = threading.Lock()
+
+    def _ensure_started(self):
+        with self._lock:
+            if self._node is not None:
+                return
+            if not rclpy.ok():
+                rclpy.init()
+            self._node = Node("gemini_emotion_bridge")
+            self._publisher = self._node.create_publisher(
+                DisplayImage, "display_image", 1
+            )
+
+    def show_emotion(self, image_id: int) -> tuple[bool, str]:
+        """Returns (successful, error_message)."""
+        self._ensure_started()
+        try:
+            message = DisplayImage()
+            message.id = ImageId(value=image_id)
+            message.format = ImageFormat(value=ImageFormat.ANIMATED_GIF)
+            self._publisher.publish(message)
+            return True, ""
+        except Exception as e:
+            logger.exception("RosEmotionBridge: show_emotion call failed")
             return False, str(e)
 
 
@@ -486,6 +619,9 @@ class GeminiAudioLoop:
         # Motor bridge handle (only started when the personality has
         # movement_access_enabled) - backs the move_joint tool call.
         self._motor_bridge: Optional[RosMotorBridge] = None
+        # Emotion bridge handle (only started when the personality has
+        # emotion_access_enabled) - backs the show_emotion tool call.
+        self._emotion_bridge: Optional[RosEmotionBridge] = None
 
         # Logging / turns (optional: write input/output wavs)
         self._turn_id = 0
@@ -934,60 +1070,90 @@ class GeminiAudioLoop:
         return None
 
     async def _handle_tool_call(self, tool_call: "genai_types.LiveServerToolCall") -> None:
-        """Executes each requested move_joint call via RosMotorBridge (off
-        the event loop, since it blocks on rclpy) and reports the outcome
-        back to Gemini so it knows whether the movement actually happened."""
+        """Executes each requested move_joint/reset_pose/show_emotion call
+        via RosMotorBridge/RosEmotionBridge (off the event loop, since they
+        block on rclpy) and reports the outcome back to Gemini so it knows
+        whether the action actually happened. Logs every call at INFO so
+        what the model actually did is visible in
+        `docker logs ros-voice-assistant`."""
         function_responses = []
+        loop = asyncio.get_running_loop()
         for call in tool_call.function_calls:
-            if call.name != "move_joint" or self._motor_bridge is None:
-                function_responses.append(
-                    genai_types.FunctionResponse(
-                        id=call.id,
-                        name=call.name,
-                        response={"error": "tool not available"},
-                    )
-                )
-                continue
-
+            logger.info(f"tool call received: {call.name}({call.args!r})")
             args = call.args or {}
-            motor_name = args.get("motor_name")
-            position = args.get("position")
-            try:
-                position = int(position)
-            except (TypeError, ValueError):
-                function_responses.append(
-                    genai_types.FunctionResponse(
-                        id=call.id,
-                        name=call.name,
-                        response={"error": f"invalid position: {position!r}"},
-                    )
-                )
-                continue
 
-            if motor_name not in MOTOR_NAMES:
-                function_responses.append(
-                    genai_types.FunctionResponse(
-                        id=call.id,
-                        name=call.name,
-                        response={"error": f"unknown motor_name: {motor_name!r}"},
+            if call.name == "reset_pose":
+                if self._motor_bridge is None:
+                    result = {"error": "movement tool not available"}
+                else:
+                    successful, error = await loop.run_in_executor(
+                        None, self._motor_bridge.reset_pose
                     )
-                )
-                continue
-
-            loop = asyncio.get_running_loop()
-            successful, error = await loop.run_in_executor(
-                None, self._motor_bridge.move_joint, motor_name, position
-            )
-            function_responses.append(
-                genai_types.FunctionResponse(
-                    id=call.id,
-                    name=call.name,
-                    response=(
+                    logger.info(
+                        f"reset_pose -> successful={successful} error={error!r}"
+                    )
+                    result = (
                         {"successful": True}
                         if successful
                         else {"successful": False, "error": error}
-                    ),
-                )
+                    )
+
+            elif call.name == "move_joint":
+                if self._motor_bridge is None:
+                    result = {"error": "movement tool not available"}
+                else:
+                    motor_name = args.get("motor_name")
+                    position = args.get("position")
+                    try:
+                        position = int(position)
+                    except (TypeError, ValueError):
+                        position = None
+
+                    if position is None:
+                        result = {"error": f"invalid position: {args.get('position')!r}"}
+                    elif motor_name not in MOTOR_NAMES:
+                        result = {"error": f"unknown motor_name: {motor_name!r}"}
+                    else:
+                        successful, error = await loop.run_in_executor(
+                            None, self._motor_bridge.move_joint, motor_name, position
+                        )
+                        logger.info(
+                            f"move_joint({motor_name!r}, {position}deg) -> "
+                            f"successful={successful} error={error!r}"
+                        )
+                        result = (
+                            {"successful": True}
+                            if successful
+                            else {"successful": False, "error": error}
+                        )
+
+            elif call.name == "show_emotion":
+                if self._emotion_bridge is None:
+                    result = {"error": "emotion tool not available"}
+                else:
+                    emotion = args.get("emotion")
+                    image_id = EMOTION_NAME_TO_IMAGE_ID.get(emotion)
+                    if image_id is None:
+                        result = {"error": f"unknown emotion: {emotion!r}"}
+                    else:
+                        successful, error = await loop.run_in_executor(
+                            None, self._emotion_bridge.show_emotion, image_id
+                        )
+                        logger.info(
+                            f"show_emotion({emotion!r}) -> "
+                            f"successful={successful} error={error!r}"
+                        )
+                        result = (
+                            {"successful": True}
+                            if successful
+                            else {"successful": False, "error": error}
+                        )
+
+            else:
+                result = {"error": f"unknown tool: {call.name!r}"}
+
+            function_responses.append(
+                genai_types.FunctionResponse(id=call.id, name=call.name, response=result)
             )
 
         try:
@@ -1176,6 +1342,7 @@ class GeminiAudioLoop:
         description = "You are pib, a humanoid robot."
         camera_enabled = False
         movement_enabled = False
+        emotion_enabled = False
         try:
             successful, personality = voice_assistant_client.get_personality_from_chat(
                 self._chat_id
@@ -1190,6 +1357,9 @@ class GeminiAudioLoop:
                 )
                 movement_enabled = bool(
                     getattr(personality, "movement_access_enabled", False)
+                )
+                emotion_enabled = bool(
+                    getattr(personality, "emotion_access_enabled", False)
                 )
         except Exception:
             logger.exception(
@@ -1216,16 +1386,40 @@ class GeminiAudioLoop:
                 description
                 + "\n\nDu kannst deinen eigenen Koerper tatsaechlich bewegen: "
                 "ruf dazu move_joint mit einem Motornamen und einer "
-                "Zielposition (-100 bis 100 Prozent) auf. Bewege Gelenke nur "
-                "in kleinen, vorsichtigen Schritten und nur wenn explizit "
-                "danach gefragt wird oder es zur Situation passt. Behaupte "
-                "niemals, dass du dich nicht bewegen kannst."
+                "Zielposition in GRAD (nicht Prozent!) auf, typischerweise "
+                "-90 bis 90 Grad, 0 ist meist die Mittelstellung. Nutze "
+                "spuerbare Winkeldifferenzen (z.B. 30-60 Grad) - sehr kleine "
+                "Werte (wenige Grad) sind auf pib kaum sichtbar. Sobald eine "
+                "gezeigte Bewegung/Geste abgeschlossen ist, rufe reset_pose "
+                "auf, um wieder in die neutrale Ausgangshaltung "
+                "zurueckzukehren - bleib nicht in einer verdrehten Position "
+                "stehen. Bewege Gelenke nur, wenn explizit danach gefragt "
+                "wird oder es zur Situation passt. Behaupte niemals, dass du "
+                "dich nicht bewegen kannst."
+            )
+
+        if emotion_enabled:
+            # Without this, Gemini has no way of knowing it can actually
+            # change its own facial expression.
+            description = (
+                description
+                + "\n\nDu kannst deine Augen auf dem Display veraendern, um "
+                "Gefuehle auszudruecken: ruf dazu show_emotion mit einem "
+                "passenden Gesichtsausdruck auf (z.B. 'happy', 'surprised', "
+                "'sad'), wann immer es zur Stimmung des Gespraechs passt - "
+                "nicht nur auf Nachfrage, sondern von dir aus waehrend des "
+                "Sprechens. Rufe 'neutral' auf, um wieder ruhig dreinzuschauen."
             )
 
         base_config = dict(CONFIG)
         base_config["system_instruction"] = description
+        tools = []
         if movement_enabled:
-            base_config["tools"] = [MOVE_JOINT_TOOL]
+            tools.extend(MOVE_JOINT_TOOL["function_declarations"])
+        if emotion_enabled:
+            tools.extend(SHOW_EMOTION_TOOL["function_declarations"])
+        if tools:
+            base_config["tools"] = [{"function_declarations": tools}]
 
         async def _connect_config():
             connection_config = dict(base_config)
@@ -1302,6 +1496,17 @@ class GeminiAudioLoop:
                         self._motor_bridge = RosMotorBridge()
                         logger.info(
                             "RosMotorBridge ready (movement_access_enabled=True)."
+                        )
+
+                    # Emotions are opt-in per personality, independent of
+                    # movement_access_enabled: the show_emotion tool call is
+                    # only usable (and only advertised to Gemini via
+                    # base_config["tools"] above) when emotion_access_enabled
+                    # is set on the active personality.
+                    if emotion_enabled:
+                        self._emotion_bridge = RosEmotionBridge()
+                        logger.info(
+                            "RosEmotionBridge ready (emotion_access_enabled=True)."
                         )
 
                     # Wait until one task errors (or requests reconnect)
