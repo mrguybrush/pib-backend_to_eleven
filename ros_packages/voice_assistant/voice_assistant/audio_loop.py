@@ -102,6 +102,40 @@ MOTOR_NAMES = [
     "wrist_right",
 ]
 
+# Human-readable (German) description per motor - injected as plain text
+# into the system_instruction (see run()) so the model can actually name
+# joints correctly when talking to the user and pick the right one for a
+# request like "heb den Arm", rather than only ever seeing the raw
+# identifiers buried in the move_joint tool schema's enum, which it tends
+# to paraphrase incorrectly.
+MOTOR_NAME_DESCRIPTIONS = """\
+- turn_head_motor: Kopf drehen (links/rechts)
+- tilt_forward_motor: Kopf nach vorne neigen
+- shoulder_vertical_left / shoulder_vertical_right: linke/rechte Schulter \
+heben und senken (Arm seitlich nach oben/unten) - das ist der Hauptmotor \
+zum "Arm heben"
+- shoulder_horizontal_left / shoulder_horizontal_right: linke/rechte \
+Schulter nach vorne/hinten schwenken
+- upper_arm_left_rotation / upper_arm_right_rotation: linken/rechten \
+Oberarm um seine eigene Achse drehen
+- elbow_left / elbow_right: linken/rechten Ellbogen beugen/strecken
+- lower_arm_left_rotation / lower_arm_right_rotation: linken/rechten \
+Unterarm um seine eigene Achse drehen
+- wrist_left / wrist_right: linkes/rechtes Handgelenk drehen
+- thumb_left_opposition / thumb_right_opposition: linken/rechten Daumen \
+zur Hand hin/weg bewegen
+- thumb_left_stretch / thumb_right_stretch: linken/rechten Daumen \
+strecken/beugen
+- index_left_stretch / index_right_stretch: linken/rechten Zeigefinger \
+strecken/beugen
+- middle_left_stretch / middle_right_stretch: linken/rechten Mittelfinger \
+strecken/beugen
+- ring_left_stretch / ring_right_stretch: linken/rechten Ringfinger \
+strecken/beugen
+- pinky_left_stretch / pinky_right_stretch: linken/rechten kleinen Finger \
+strecken/beugen\
+"""
+
 # Gemini Live function-calling tools: let the model actually move pib's
 # motors (only added to the session config when the active personality has
 # movement_access_enabled).
@@ -1381,21 +1415,33 @@ class GeminiAudioLoop:
 
         if movement_enabled:
             # Without this, Gemini has no way of knowing it can actually
-            # move the robot and defaults to claiming it cannot.
+            # move the robot and defaults to claiming it cannot. The full
+            # motor_name -> German description list is included as plain
+            # readable text (not just buried in the move_joint tool
+            # schema's enum) so the model can actually name joints
+            # correctly and reliably pick the right one, e.g. for "heb den
+            # Arm" -> shoulder_vertical_left/right.
             description = (
                 description
-                + "\n\nDu kannst deinen eigenen Koerper tatsaechlich bewegen: "
-                "ruf dazu move_joint mit einem Motornamen und einer "
-                "Zielposition in GRAD (nicht Prozent!) auf, typischerweise "
-                "-90 bis 90 Grad, 0 ist meist die Mittelstellung. Nutze "
-                "spuerbare Winkeldifferenzen (z.B. 30-60 Grad) - sehr kleine "
-                "Werte (wenige Grad) sind auf pib kaum sichtbar. Sobald eine "
-                "gezeigte Bewegung/Geste abgeschlossen ist, rufe reset_pose "
-                "auf, um wieder in die neutrale Ausgangshaltung "
-                "zurueckzukehren - bleib nicht in einer verdrehten Position "
-                "stehen. Bewege Gelenke nur, wenn explizit danach gefragt "
-                "wird oder es zur Situation passt. Behaupte niemals, dass du "
-                "dich nicht bewegen kannst."
+                + "\n\nDu kannst deinen eigenen Koerper tatsaechlich bewegen "
+                "- das ist keine Simulation, ruf dazu WIRKLICH die Funktion "
+                "move_joint auf (nicht nur ankuendigen, dass du es tust). "
+                "Verfuegbare Gelenke (motor_name: Bedeutung):\n"
+                + MOTOR_NAME_DESCRIPTIONS
+                + "\n\nposition ist der Zielwinkel in GRAD (nicht Prozent!), "
+                "typischerweise -90 bis 90, 0 ist meist die Mittelstellung. "
+                "Nutze spuerbare Winkeldifferenzen (z.B. 30-60 Grad) - sehr "
+                "kleine Werte (wenige Grad) sind auf pib kaum sichtbar. Fuer "
+                "'heb den Arm' reicht meist EIN Aufruf von "
+                "shoulder_vertical_left oder shoulder_vertical_right mit "
+                "einem deutlichen Winkel. Sobald eine gezeigte Bewegung/"
+                "Geste abgeschlossen ist, rufe reset_pose auf, um wieder in "
+                "die neutrale Ausgangshaltung zurueckzukehren - bleib nicht "
+                "in einer verdrehten Position stehen. Bewege Gelenke nur, "
+                "wenn explizit danach gefragt wird oder es zur Situation "
+                "passt. Behaupte niemals, dass du dich nicht bewegen "
+                "kannst oder die Gelenknamen nicht kennst - sie stehen "
+                "oben."
             )
 
         if emotion_enabled:

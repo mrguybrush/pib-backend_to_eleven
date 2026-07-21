@@ -1,6 +1,7 @@
 from queue import Queue
 import base64
 import gc
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import cycle
@@ -150,32 +151,51 @@ class Animation:
     def _load_frames_into_queue(
         self, queue: Queue, data: bytes, width: int, height: int
     ) -> None:
-        with PIL.Image.open(BytesIO(data)) as image:
-            # iterate over frames of image
-            for i in range(image.n_frames):
-                # go to i-th frame of the image
-                image.seek(i)
-                # resize the current frame, to fit the screen-size
-                resized = (
-                    image.resize((width, height))
-                    if image.width != width or image.height != height
-                    else image
-                )
-                # buffer for storing binary data of image-frames
-                data_buffer = BytesIO()
-                # save the current frame in the data-buffer
-                resized.save(data_buffer, "gif")
-                # extract data from buffer and encode bytes as base64
-                data = base64.b64encode(data_buffer.getvalue())
-                # get the duration of the current frame - falls back to a
-                # sensible hold time if the gif doesn't specify one (common
-                # for a simple single-frame/static gif exported by hand,
-                # e.g. from an image editor, rather than generated with
-                # explicit per-frame durations like the other emotions here)
-                duration_ms = image.info.get("duration", 2000)
-                # yield the extracted data
-                queue.put((data, duration_ms))
-            # 'None' -> all frames were processed
+        # This runs in a background Thread - any uncaught exception here
+        # kills the thread silently (Python just logs it to stderr) WITHOUT
+        # ever putting the (None, -1) sentinel into the queue. The consuming
+        # generator (_as_frames) then blocks forever on queue.get(), and
+        # since it's only ever advanced from the Tk main loop
+        # (_show_next_frame), that hangs the ENTIRE display - no further
+        # image can be shown until the process is restarted. A gif with an
+        # unusual size/mode/frame count PIL trips over (rather than a
+        # crash) is exactly the case that used to freeze the display this
+        # way, so every exit path below explicitly puts the sentinel.
+        try:
+            with PIL.Image.open(BytesIO(data)) as image:
+                # iterate over frames of image
+                for i in range(image.n_frames):
+                    # go to i-th frame of the image
+                    image.seek(i)
+                    # resize the current frame, to fit the screen-size
+                    resized = (
+                        image.resize((width, height))
+                        if image.width != width or image.height != height
+                        else image
+                    )
+                    # buffer for storing binary data of image-frames
+                    data_buffer = BytesIO()
+                    # save the current frame in the data-buffer
+                    resized.save(data_buffer, "gif")
+                    # extract data from buffer and encode bytes as base64
+                    frame_data = base64.b64encode(data_buffer.getvalue())
+                    # get the duration of the current frame - falls back to a
+                    # sensible hold time if the gif doesn't specify one
+                    # (common for a simple single-frame/static gif exported
+                    # by hand, e.g. from an image editor, rather than
+                    # generated with explicit per-frame durations like the
+                    # other emotions here)
+                    duration_ms = image.info.get("duration", 2000)
+                    # yield the extracted data
+                    queue.put((frame_data, duration_ms))
+        except Exception:
+            logging.getLogger("display").exception(
+                "failed to decode/resize gif frames - showing nothing for "
+                "this image instead of hanging the display"
+            )
+        finally:
+            # 'None' -> all frames were processed (or loading failed) -
+            # ALWAYS put this so the consuming generator can terminate.
             queue.put((None, -1))
 
 
