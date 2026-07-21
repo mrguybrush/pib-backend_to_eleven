@@ -65,6 +65,23 @@ STATIC_IMAGE_DIR: str = os.getenv(
 )
 
 
+def _detect_image_format(data: bytes) -> int:
+    """Sniffs the magic header to tell gif/png/jpeg apart - used for custom
+    facial expressions, which (unlike the fixed emotions) can be any of the
+    three (see facial_expression_controller.py's upload validation)."""
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ImageFormat.ANIMATED_GIF
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ImageFormat.PNG
+    if data.startswith(b"\xff\xd8\xff"):
+        return ImageFormat.JPEG
+    # Fall back to gif (previous hardcoded behaviour) rather than raising -
+    # _show_image already resolves an unknown format_value via the "else"
+    # branch (_show_static_image), which will simply fail to decode and log
+    # rather than hang.
+    return ImageFormat.ANIMATED_GIF
+
+
 @dataclass
 class ImageFile:
     """represents an image stored in the filesystem"""
@@ -548,7 +565,8 @@ class DisplayNode(Node):
                 timeout=5,
             )
             reply.raise_for_status()
-            self.image_queue.put(RawImage(ImageFormat.ANIMATED_GIF, reply.content))
+            image_format = _detect_image_format(reply.content)
+            self.image_queue.put(RawImage(image_format, reply.content))
             response.successful = True
         except Exception as e:
             self.get_logger().error(

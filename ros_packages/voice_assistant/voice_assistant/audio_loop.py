@@ -12,6 +12,7 @@ import base64
 import os
 import logging
 import threading
+import uuid
 from typing import Any, Optional
 
 import numpy as np
@@ -276,6 +277,21 @@ LIVE_RECONNECT_BACKOFF_S = float(os.getenv("LIVE_RECONNECT_BACKOFF_S", "0.5"))
 MIC_MUTE_TRAIL_S = float(os.getenv("MIC_MUTE_TRAIL_S", "0.6"))
 
 
+def _unique_node_name(base: str) -> str:
+    """Every *Bridge class below creates a fresh ROS Node whenever a new
+    Gemini Live session starts (incl. reconnects, which happen
+    automatically every ~10 min per the GoAway limit - see 'Reconnect
+    requested' in the logs). The previous node from the prior session is
+    never explicitly destroyed, so reusing the same fixed name for the new
+    one creates a DUPLICATE ROS node name in the graph - this is exactly
+    why movement/camera/emotion tools worked on the first attempt in a
+    session but silently stopped working after a reconnect ("geht manchmal,
+    aber nicht immer"): the new node's client/publisher can end up bound to
+    a confused/stale piece of the DDS graph. A random per-instance suffix
+    keeps every node name unique for the life of the process."""
+    return f"{base}_{uuid.uuid4().hex[:8]}"
+
+
 class ReconnectRequested(RuntimeError):
     """Raised by tasks to request a clean Live session reconnect."""
 
@@ -336,7 +352,7 @@ class RosAudioBridge:
                 """Tiny ROS node that receives PCM and forwards to asyncio queue."""
 
                 def __init__(self, topic, loop, queue, stop_evt):
-                    super().__init__("ros_audio_bridge")
+                    super().__init__(_unique_node_name("ros_audio_bridge"))
                     self._loop = loop
                     self._queue = queue
                     self._stop_evt = stop_evt
@@ -467,7 +483,7 @@ class RosCameraBridge:
         try:
             if not rclpy.ok():
                 rclpy.init()
-            self._node = Node("gemini_camera_bridge")
+            self._node = Node(_unique_node_name("gemini_camera_bridge"))
             self._client = self._node.create_client(
                 GetCameraImage, "get_camera_image"
             )
@@ -526,7 +542,7 @@ class RosMotorBridge:
                 return
             if not rclpy.ok():
                 rclpy.init()
-            self._node = Node("gemini_motor_bridge")
+            self._node = Node(_unique_node_name("gemini_motor_bridge"))
             self._client = self._node.create_client(
                 ApplyJointTrajectory, "apply_joint_trajectory"
             )
@@ -594,7 +610,7 @@ class RosEmotionBridge:
                 return
             if not rclpy.ok():
                 rclpy.init()
-            self._node = Node("gemini_emotion_bridge")
+            self._node = Node(_unique_node_name("gemini_emotion_bridge"))
             self._publisher = self._node.create_publisher(
                 DisplayImage, "display_image", 1
             )
@@ -895,7 +911,7 @@ class GeminiAudioLoop:
         if self._srv_node is None:
             if not rclpy.ok():
                 rclpy.init()
-            self._srv_node = Node("gemini_audio_loop_client")
+            self._srv_node = Node(_unique_node_name("gemini_audio_loop_client"))
             self._srv_client = self._srv_node.create_client(
                 CreateOrUpdateChatMessage, "create_or_update_chat_message"
             )
