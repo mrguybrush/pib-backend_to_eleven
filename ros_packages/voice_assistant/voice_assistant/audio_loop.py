@@ -20,7 +20,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import Int16MultiArray
-from pib_api_client import voice_assistant_client, pose_client
+from pib_api_client import (
+    voice_assistant_client,
+    pose_client,
+    motor_client,
+    facial_expression_client,
+)
 
 import pyaudio
 from google import genai
@@ -41,6 +46,9 @@ from datatypes.srv import GetCameraImage
 # rotation_range_min/max safety clamp (Motor._validate_position) applies
 # here too with no extra code.
 from datatypes.srv import ApplyJointTrajectory
+# show_emotion tool, custom-facial-expression branch: same service the
+# Blockly set_eyes_emotion block uses for a user-uploaded expression.
+from datatypes.srv import ShowCustomFacialExpression
 # show_emotion tool - publishes the same display_image topic the Pose page's
 # emotion buttons and Blockly's set_eyes_emotion block use.
 from datatypes.msg import DisplayImage, ImageId, ImageFormat
@@ -208,39 +216,94 @@ EMOTION_NAME_TO_IMAGE_ID = {
     "angry": ImageId.PIB_EYES_ANGRY,
     "surprised": ImageId.PIB_EYES_SURPRISED,
     "sleepy": ImageId.PIB_EYES_SLEEPY,
+    "heart": ImageId.PIB_EYES_HEART,
     "star": ImageId.PIB_EYES_STAR,
     "cool": ImageId.PIB_EYES_COOL,
     "wink": ImageId.PIB_EYES_WINK,
 }
 
-# Gemini Live function-calling tool: lets the model show a facial expression
-# on pib's display matching the mood of the conversation (only added when
-# the active personality has emotion_access_enabled - independent of
-# movement_access_enabled).
-SHOW_EMOTION_TOOL = {
-    "function_declarations": [
-        {
-            "name": "show_emotion",
-            "description": (
-                "Zeigt einen Gesichtsausdruck auf pibs Display, passend zur "
-                "Stimmung des Gespraechs (z.B. 'happy' wenn du dich freust, "
-                "'surprised' bei einer ueberraschenden Wendung). 'neutral' "
-                "setzt die normalen, ruhigen Augen zurueck."
-            ),
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "emotion": {
-                        "type": "STRING",
-                        "enum": list(EMOTION_NAME_TO_IMAGE_ID.keys()),
-                        "description": "Welcher Gesichtsausdruck gezeigt werden soll.",
-                    },
-                },
-                "required": ["emotion"],
-            },
-        }
-    ]
+# German words the model might reasonably use for an emotion name if a
+# German-speaking user asks for it by its German name (e.g. "zwinkere mal")
+# - the enum below is deliberately still English-keyed (fixed identifiers,
+# consistent with the rest of the codebase), but this mapping is included
+# as plain text in the system prompt so the model reliably translates
+# rather than guessing/inventing a value outside the enum.
+EMOTION_GERMAN_NAMES = {
+    "neutral": "neutral/ruhig",
+    "happy": "froehlich",
+    "sad": "traurig",
+    "angry": "wuetend",
+    "surprised": "ueberrascht",
+    "sleepy": "muede",
+    "heart": "verliebt",
+    "star": "begeistert",
+    "cool": "cool",
+    "wink": "zwinkern",
 }
+
+
+def _show_emotion_tool(emotion_names: list[str]) -> dict:
+    """Builds the show_emotion function declaration for a given list of
+    valid emotion names (fixed ones plus, if any, the names of the
+    personality's custom facial expressions - see run())."""
+    return {
+        "function_declarations": [
+            {
+                "name": "show_emotion",
+                "description": (
+                    "Zeigt einen Gesichtsausdruck auf pibs Display, passend "
+                    "zur Stimmung des Gespraechs (z.B. 'happy' wenn du dich "
+                    "freust, 'surprised' bei einer ueberraschenden Wendung). "
+                    "'neutral' setzt die normalen, ruhigen Augen zurueck."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "emotion": {
+                            "type": "STRING",
+                            "enum": emotion_names,
+                            "description": (
+                                "Welcher Gesichtsausdruck gezeigt werden "
+                                "soll - exakt einer dieser Werte."
+                            ),
+                        },
+                    },
+                    "required": ["emotion"],
+                },
+            }
+        ]
+    }
+
+
+def _move_to_pose_tool(pose_names: list[str]) -> dict:
+    """Builds the move_to_pose function declaration for the personality's
+    currently existing poses (fetched once at session start - see run()).
+    Reuses the exact same apply_joint_trajectory path move_joint/reset_pose
+    already go through (see RosMotorBridge.move_to_pose)."""
+    return {
+        "function_declarations": [
+            {
+                "name": "move_to_pose",
+                "description": (
+                    "Bewegt pib in eine vom Nutzer gespeicherte Pose (alle "
+                    "Gelenke gleichzeitig), z.B. wenn jemand sagt 'nimm die "
+                    "Pose Winken ein' oder 'mach die Begruessung'."
+                ),
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "pose_name": {
+                            "type": "STRING",
+                            "enum": pose_names,
+                            "description": "Name der einzunehmenden Pose.",
+                        },
+                    },
+                    "required": ["pose_name"],
+                },
+            }
+        ]
+    }
+
 
 ROS_AUDIO_TOPIC = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
 # how often (seconds) a camera still is polled and sent to Gemini as video
@@ -277,6 +340,26 @@ LIVE_RECONNECT_BACKOFF_S = float(os.getenv("LIVE_RECONNECT_BACKOFF_S", "0.5"))
 MIC_MUTE_TRAIL_S = float(os.getenv("MIC_MUTE_TRAIL_S", "0.6"))
 
 
+# Serializes EVERY rclpy waitset-touching call in this process (spin_once
+# AND spin_until_future_complete), across ALL the independent bridge
+# threads below (audio/camera/motor/emotion/chat-persistence). Each bridge
+# creates its own Node, but they all share the SAME default rclpy Context,
+# and rclpy's wait set is context-scoped, not node-scoped - concurrent
+# spins from different threads on that shared context race on the same
+# underlying wait set and corrupt it. Root-caused via
+# 'RosCameraBridge: get_camera_image call failed' / 'IndexError: wait set
+# index too big' appearing continuously in the logs (the camera bridge
+# polls every ~1s while RosAudioBridge spins in a tight 0.1s loop for the
+# entire session) - this is almost certainly also behind "Sprachassistent
+# manchmal langsam/keine Reaktion", since any tool call (move_joint,
+# show_emotion, chat-message persistence) can silently lose its race the
+# same way. A per-bridge-instance lock (see RosMotorBridge/RosEmotionBridge
+# below) only protects against two calls of the SAME bridge overlapping,
+# not against different bridges racing each other - hence one process-wide
+# lock instead.
+RCLPY_SPIN_LOCK = threading.Lock()
+
+
 def _unique_node_name(base: str) -> str:
     """Every *Bridge class below creates a fresh ROS Node whenever a new
     Gemini Live session starts (incl. reconnects, which happen
@@ -290,6 +373,29 @@ def _unique_node_name(base: str) -> str:
     a confused/stale piece of the DDS graph. A random per-instance suffix
     keeps every node name unique for the life of the process."""
     return f"{base}_{uuid.uuid4().hex[:8]}"
+
+
+def _motors_powered_on() -> bool:
+    """Best-effort check of whether pib's motors are actually receiving
+    power (see the 'turnedOn' field on GET /motor, the same one the
+    Pinbelegung page shows/toggles). If the physical power switch/relay is
+    off, move_joint/reset_pose/move_to_pose calls silently do nothing on
+    the hardware side - from the user's perspective indistinguishable from
+    the AI simply not trying, so this is checked before every movement
+    tool call and reported back explicitly instead. Fails OPEN (returns
+    True) on any API error, so a flaky Flask request never blocks
+    movement outright."""
+    try:
+        successful, response = motor_client.get_all_motors()
+        if not successful or not response:
+            return True
+        motors = response.get("motors", [])
+        if not motors:
+            return True
+        return any(m.get("turnedOn") for m in motors)
+    except Exception:
+        logger.exception("_motors_powered_on: failed to check motor power state")
+        return True
 
 
 class ReconnectRequested(RuntimeError):
@@ -408,7 +514,8 @@ class RosAudioBridge:
             executor = SingleThreadedExecutor(context=rclpy.get_default_context())
             executor.add_node(node)
             while not self._stop_evt.is_set():
-                executor.spin_once(timeout_sec=0.1)
+                with RCLPY_SPIN_LOCK:
+                    executor.spin_once(timeout_sec=0.1)
             executor.shutdown()
             node.destroy_node()
 
@@ -496,9 +603,10 @@ class RosCameraBridge:
                 if self._client.service_is_ready():
                     try:
                         future = self._client.call_async(GetCameraImage.Request())
-                        rclpy.spin_until_future_complete(
-                            self._node, future, timeout_sec=1.0
-                        )
+                        with RCLPY_SPIN_LOCK:
+                            rclpy.spin_until_future_complete(
+                                self._node, future, timeout_sec=1.0
+                            )
                         if future.done() and future.result() is not None:
                             image_base64 = future.result().image_base64
                             if image_base64:
@@ -564,7 +672,7 @@ class RosMotorBridge:
         request.joint_trajectory = jt
         try:
             future = self._client.call_async(request)
-            with self._lock:
+            with self._lock, RCLPY_SPIN_LOCK:
                 rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
             if not future.done() or future.result() is None:
                 return False, "timed out waiting for motor response"
@@ -591,6 +699,18 @@ class RosMotorBridge:
         joint_positions = [float(p["position"]) for p in positions]
         return self._apply(joint_names, joint_positions)
 
+    def move_to_pose(self, pose_name: str) -> tuple[bool, str]:
+        """Moves every joint into the given user-saved pose."""
+        successful, motor_positions = pose_client.get_pose_by_name(pose_name)
+        if not successful or motor_positions is None:
+            return False, f"could not find pose '{pose_name}'"
+        positions = motor_positions.get("motorPositions", [])
+        if not positions:
+            return False, f"pose '{pose_name}' has no motor positions"
+        joint_names = [p["motorName"] for p in positions]
+        joint_positions = [float(p["position"]) for p in positions]
+        return self._apply(joint_names, joint_positions)
+
 
 class RosEmotionBridge:
     """Backs the show_emotion Gemini function-calling tool: a small,
@@ -602,6 +722,7 @@ class RosEmotionBridge:
     def __init__(self):
         self._node: Optional[Node] = None
         self._publisher = None
+        self._custom_client = None
         self._lock = threading.Lock()
 
     def _ensure_started(self):
@@ -614,9 +735,12 @@ class RosEmotionBridge:
             self._publisher = self._node.create_publisher(
                 DisplayImage, "display_image", 1
             )
+            self._custom_client = self._node.create_client(
+                ShowCustomFacialExpression, "show_custom_facial_expression"
+            )
 
     def show_emotion(self, image_id: int) -> tuple[bool, str]:
-        """Returns (successful, error_message)."""
+        """Shows one of the fixed emotions. Returns (successful, error_message)."""
         self._ensure_started()
         try:
             message = DisplayImage()
@@ -626,6 +750,25 @@ class RosEmotionBridge:
             return True, ""
         except Exception as e:
             logger.exception("RosEmotionBridge: show_emotion call failed")
+            return False, str(e)
+
+    def show_custom_emotion(self, expression_id: str) -> tuple[bool, str]:
+        """Shows one of the personality's custom (user-uploaded) facial
+        expressions, by expression_id. Returns (successful, error_message)."""
+        self._ensure_started()
+        if not self._custom_client.wait_for_service(timeout_sec=3.0):
+            return False, "show_custom_facial_expression service not available"
+        request = ShowCustomFacialExpression.Request()
+        request.expression_id = expression_id
+        try:
+            future = self._custom_client.call_async(request)
+            with self._lock, RCLPY_SPIN_LOCK:
+                rclpy.spin_until_future_complete(self._node, future, timeout_sec=5.0)
+            if not future.done() or future.result() is None:
+                return False, "timed out waiting for display response"
+            return bool(future.result().successful), ""
+        except Exception as e:
+            logger.exception("RosEmotionBridge: show_custom_emotion call failed")
             return False, str(e)
 
 
@@ -943,9 +1086,10 @@ class GeminiAudioLoop:
                         continue
 
                     future = self._srv_client.call_async(req)
-                    rclpy.spin_until_future_complete(
-                        self._srv_node, future, timeout_sec=1.0
-                    )
+                    with RCLPY_SPIN_LOCK:
+                        rclpy.spin_until_future_complete(
+                            self._srv_node, future, timeout_sec=1.0
+                        )
 
                     if (
                         future.done()
@@ -1128,9 +1272,37 @@ class GeminiAudioLoop:
         `docker logs ros-voice-assistant`."""
         function_responses = []
         loop = asyncio.get_running_loop()
+        movement_tools = {"reset_pose", "move_joint", "move_to_pose"}
         for call in tool_call.function_calls:
             logger.info(f"tool call received: {call.name}({call.args!r})")
             args = call.args or {}
+
+            if call.name in movement_tools and self._motor_bridge is not None:
+                # The physical power relay cuts current to the servos
+                # without pib otherwise knowing - move_joint/reset_pose/
+                # move_to_pose would then just silently do nothing, which
+                # looks to the user exactly like the AI not trying at all.
+                # Checked before every movement call rather than once per
+                # session, since the user can flip the switch mid-chat.
+                powered_on = await loop.run_in_executor(None, _motors_powered_on)
+                if not powered_on:
+                    logger.warning(f"{call.name} blocked: motors are powered off")
+                    function_responses.append(
+                        genai_types.FunctionResponse(
+                            id=call.id,
+                            name=call.name,
+                            response={
+                                "successful": False,
+                                "error": (
+                                    "motors_powered_off: sag dem Nutzer, dass er "
+                                    "zuerst den Motorstrom (Pinbelegung/Alle "
+                                    "Gelenke) einschalten muss, sonst kannst du "
+                                    "dich nicht bewegen."
+                                ),
+                            },
+                        )
+                    )
+                    continue
 
             if call.name == "reset_pose":
                 if self._motor_bridge is None:
@@ -1177,18 +1349,47 @@ class GeminiAudioLoop:
                             else {"successful": False, "error": error}
                         )
 
+            elif call.name == "move_to_pose":
+                if self._motor_bridge is None:
+                    result = {"error": "movement tool not available"}
+                else:
+                    pose_name = args.get("pose_name")
+                    successful, error = await loop.run_in_executor(
+                        None, self._motor_bridge.move_to_pose, pose_name
+                    )
+                    logger.info(
+                        f"move_to_pose({pose_name!r}) -> "
+                        f"successful={successful} error={error!r}"
+                    )
+                    result = (
+                        {"successful": True}
+                        if successful
+                        else {"successful": False, "error": error}
+                    )
+
             elif call.name == "show_emotion":
                 if self._emotion_bridge is None:
                     result = {"error": "emotion tool not available"}
                 else:
                     emotion = args.get("emotion")
                     image_id = EMOTION_NAME_TO_IMAGE_ID.get(emotion)
-                    if image_id is None:
-                        result = {"error": f"unknown emotion: {emotion!r}"}
-                    else:
+                    custom_expression_id = self._custom_emotion_name_to_id.get(emotion)
+                    if image_id is not None:
                         successful, error = await loop.run_in_executor(
                             None, self._emotion_bridge.show_emotion, image_id
                         )
+                    elif custom_expression_id is not None:
+                        successful, error = await loop.run_in_executor(
+                            None,
+                            self._emotion_bridge.show_custom_emotion,
+                            custom_expression_id,
+                        )
+                    else:
+                        successful, error = None, None
+
+                    if successful is None:
+                        result = {"error": f"unknown emotion: {emotion!r}"}
+                    else:
                         logger.info(
                             f"show_emotion({emotion!r}) -> "
                             f"successful={successful} error={error!r}"
@@ -1457,20 +1658,79 @@ class GeminiAudioLoop:
                 "wenn explizit danach gefragt wird oder es zur Situation "
                 "passt. Behaupte niemals, dass du dich nicht bewegen "
                 "kannst oder die Gelenknamen nicht kennst - sie stehen "
-                "oben."
+                "oben. Falls eine Bewegung mit dem Fehler "
+                "'motors_powered_off' fehlschlaegt, ist der Motorstrom "
+                "ausgeschaltet - sag dem Nutzer freundlich, dass er ihn "
+                "erst einschalten muss (Seite Gelenksteuerung/Pinbelegung), "
+                "bevor du dich bewegen kannst."
             )
+
+        # Custom (user-uploaded) facial expressions, by name -> expression_id
+        # - fetched once here so show_emotion's enum/description can list
+        # them alongside the fixed emotions (see task: "wenn eine neue
+        # Personality angelegt wird, koennen die manuell hinzugefuegten
+        # Gesichtsausdruecke nicht eingestellt werden" - they simply weren't
+        # in the tool's enum at all before).
+        self._custom_emotion_name_to_id: dict[str, str] = {}
+        if emotion_enabled:
+            try:
+                successful, response = (
+                    facial_expression_client.get_all_facial_expressions()
+                )
+                if successful and response:
+                    for expr in response.get("facialExpressions", []):
+                        self._custom_emotion_name_to_id[expr["name"]] = expr[
+                            "expressionId"
+                        ]
+            except Exception:
+                logger.exception("Failed to fetch custom facial expressions")
+
+        # All of the user's saved poses, by name - fetched once here so
+        # move_to_pose's enum can list them (task: "der Sprachassistent
+        # soll auch alle aktuellen Posen kennen").
+        pose_names: list[str] = []
+        if movement_enabled:
+            try:
+                successful, response = pose_client.get_all_poses()
+                if successful and response:
+                    pose_names = [p["name"] for p in response.get("poses", [])]
+            except Exception:
+                logger.exception("Failed to fetch poses")
 
         if emotion_enabled:
             # Without this, Gemini has no way of knowing it can actually
-            # change its own facial expression.
+            # change its own facial expression. Deutsche Namen werden mit
+            # aufgelistet, damit z.B. "zwinkere mal" zuverlaessig auf den
+            # englischen enum-Wert 'wink' abgebildet wird, statt dass das
+            # Modell einen nicht existierenden Wert wie 'zwinkern' rät.
+            emotion_translations = ", ".join(
+                f"{name} ({german})" for name, german in EMOTION_GERMAN_NAMES.items()
+            )
+            custom_names_text = (
+                ("\nEigene, vom Nutzer hochgeladene Ausdruecke: " + ", ".join(
+                    self._custom_emotion_name_to_id.keys()
+                ))
+                if self._custom_emotion_name_to_id
+                else ""
+            )
             description = (
                 description
                 + "\n\nDu kannst deine Augen auf dem Display veraendern, um "
                 "Gefuehle auszudruecken: ruf dazu show_emotion mit einem "
-                "passenden Gesichtsausdruck auf (z.B. 'happy', 'surprised', "
-                "'sad'), wann immer es zur Stimmung des Gespraechs passt - "
-                "nicht nur auf Nachfrage, sondern von dir aus waehrend des "
-                "Sprechens. Rufe 'neutral' auf, um wieder ruhig dreinzuschauen."
+                "passenden Gesichtsausdruck auf, wann immer es zur Stimmung "
+                "des Gespraechs passt - nicht nur auf Nachfrage, sondern von "
+                "dir aus waehrend des Sprechens. Rufe 'neutral' auf, um "
+                "wieder ruhig dreinzuschauen. Verfuegbare Werte (deutscher "
+                f"Name in Klammern): {emotion_translations}.{custom_names_text}"
+            )
+
+        if movement_enabled and pose_names:
+            description = (
+                description
+                + "\n\nDu kennst ausserdem alle gespeicherten Posen von pib "
+                "und kannst sie per move_to_pose einnehmen, wenn jemand "
+                "danach fragt (z.B. 'nimm die Pose Winken ein'). "
+                f"Verfuegbare Posen: {', '.join(pose_names)}."
             )
 
         base_config = dict(CONFIG)
@@ -1478,8 +1738,13 @@ class GeminiAudioLoop:
         tools = []
         if movement_enabled:
             tools.extend(MOVE_JOINT_TOOL["function_declarations"])
+            if pose_names:
+                tools.extend(_move_to_pose_tool(pose_names)["function_declarations"])
         if emotion_enabled:
-            tools.extend(SHOW_EMOTION_TOOL["function_declarations"])
+            emotion_names = list(EMOTION_NAME_TO_IMAGE_ID.keys()) + list(
+                self._custom_emotion_name_to_id.keys()
+            )
+            tools.extend(_show_emotion_tool(emotion_names)["function_declarations"])
         if tools:
             base_config["tools"] = [{"function_declarations": tools}]
 

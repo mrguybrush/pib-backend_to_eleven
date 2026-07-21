@@ -17,6 +17,20 @@ def set_auto_off():
     return jsonify({"autoOffMinutes": result})
 
 
+@bp.route("/ip-overlay-seconds", methods=["GET"])
+def get_ip_overlay_seconds():
+    return jsonify(
+        {"ipOverlaySeconds": system_settings_service.get_ip_overlay_seconds()}
+    )
+
+
+@bp.route("/ip-overlay-seconds", methods=["PUT"])
+def set_ip_overlay_seconds():
+    seconds = (request.json or {}).get("ipOverlaySeconds")
+    result = system_settings_service.set_ip_overlay_seconds(seconds)
+    return jsonify({"ipOverlaySeconds": result})
+
+
 @bp.route("/menu-visibility", methods=["GET"])
 def get_menu_visibility():
     return jsonify(system_settings_service.get_menu_visibility())

@@ -51,3 +51,9 @@ class AppSettings(db.Model):
     hide_voice_assistant_nav = db.Column(db.Boolean, nullable=False, default=False)
     hide_program_nav = db.Column(db.Boolean, nullable=False, default=False)
     hide_system_nav = db.Column(db.Boolean, nullable=False, default=False)
+
+    # Wie lange die IP-Adresse+QR-Code-Overlay beim Hochfahren (und nach
+    # Klick auf den QR-Code im Frontend) angezeigt wird, bevor auf die
+    # normalen Augen zurueckgeschaltet wird. 0 = Overlay wird gar nicht
+    # angezeigt.
+    ip_overlay_seconds = db.Column(db.Integer, nullable=False, default=20)

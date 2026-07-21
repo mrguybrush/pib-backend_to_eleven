@@ -4,8 +4,14 @@ from urllib.parse import quote
 
 from pib_api_client import send_request, URL_PREFIX
 
+POSES_URL = URL_PREFIX + "/pose"
 MOTOR_POSITIONS_OF_POSE_URL = URL_PREFIX + "/pose/%s/motor-positions"
 POSE_BY_NAME_URL = URL_PREFIX + "/pose/by-name/%s"
+
+
+def get_all_poses() -> tuple[bool, dict[str, Any] | None]:
+    request = Request(POSES_URL, method="GET")
+    return send_request(request)
 
 
 def get_motor_positions_of_pose(pose_id) -> tuple[bool, dict[str, Any] | None]:

@@ -37,6 +37,18 @@ def set_auto_off_minutes(minutes: Optional[int]) -> Optional[int]:
     return settings.auto_off_minutes
 
 
+def get_ip_overlay_seconds() -> int:
+    return _get_settings().ip_overlay_seconds
+
+
+def set_ip_overlay_seconds(seconds: int) -> int:
+    seconds = max(0, int(seconds))
+    settings = _get_settings()
+    settings.ip_overlay_seconds = seconds
+    db.session.flush()
+    return settings.ip_overlay_seconds
+
+
 def get_menu_visibility() -> dict:
     settings = _get_settings()
     return {

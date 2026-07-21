@@ -29,6 +29,7 @@ from datatypes.msg import DisplayImage, ImageFormat, ImageId
 from datatypes.srv import ShowCustomFacialExpression
 from pib_api_client import URL_PREFIX
 from pib_api_client import ip_client
+from pib_api_client import system_settings_client
 
 import os
 
@@ -502,7 +503,11 @@ class DisplayNode(Node):
             self.on_show_custom_facial_expression,
         )
 
-        startup_image = self._build_ip_overlay_image() or pib_eyes_animated
+        overlay_seconds = self._get_ip_overlay_seconds()
+        startup_image = (
+            (self._build_ip_overlay_image() if overlay_seconds > 0 else None)
+            or pib_eyes_animated
+        )
         self.image_queue.put(startup_image)
 
         if startup_image is not pib_eyes_animated:
@@ -510,9 +515,21 @@ class DisplayNode(Node):
             # it's had its time on screen. If a "real" image has been
             # requested via the display_image topic in the meantime, this
             # will interrupt it once; acceptable for a one-shot boot notice.
-            self._revert_to_eyes_after(IP_OVERLAY_SECONDS)
+            self._revert_to_eyes_after(overlay_seconds)
 
         self.get_logger().info("Now Running DISPLAY")
+
+    def _get_ip_overlay_seconds(self) -> float:
+        """User-configurable duration (System-Einstellungen) the IP/QR
+        overlay stays up - 0 means don't show it at all. Falls back to the
+        previous fixed default on any API error."""
+        try:
+            successful, seconds = system_settings_client.get_ip_overlay_seconds()
+            if successful and seconds is not None:
+                return float(seconds)
+        except Exception:
+            self.get_logger().exception("failed to fetch ip_overlay_seconds")
+        return IP_OVERLAY_SECONDS
 
     def _build_ip_overlay_image(self) -> Optional[RawImage]:
         """Fetches the host IP and renders the 'IP-Adresse + QR-Code'
@@ -540,11 +557,14 @@ class DisplayNode(Node):
         """Show the IP+QR overlay now (same duration as at boot), then revert
         to the eyes - triggered by the frontend when the user opens the QR
         code, so the code is scannable straight off pib's own screen."""
+        overlay_seconds = self._get_ip_overlay_seconds()
+        if overlay_seconds <= 0:
+            return
         overlay = self._build_ip_overlay_image()
         if overlay is None:
             return
         self.image_queue.put(overlay)
-        self._revert_to_eyes_after(IP_OVERLAY_SECONDS)
+        self._revert_to_eyes_after(overlay_seconds)
 
     def on_display_image_received(self, display_image: DisplayImage):
         """callback function for the 'display_image'-topic subscriber"""
