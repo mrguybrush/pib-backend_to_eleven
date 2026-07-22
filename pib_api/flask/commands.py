@@ -38,11 +38,30 @@ def seed_db() -> None:
     print("Seeded the database with default data.")
 
 
+# Tabellen, die von Migrationen mit einer Default-Singleton-Zeile (id=1)
+# vorbefuellt werden - sie sind KEIN Zeichen dafuer, dass die DB bereits
+# geseedet wurde. Zaehlt man sie mit, haelt _is_empty_db() eine FRISCH
+# migrierte DB faelschlich fuer belegt und seed_db ueberspringt das
+# komplette Grund-Seeding (Bricklets/Motoren/Relais-Bricklet/Personas).
+# Genau der Fehler auf einem frisch installierten System: dort laufen ALLE
+# Migrationen VOR seed_db (anders als historisch gewachsen, wo geseedet
+# wurde, bevor es diese Settings-Migrationen ueberhaupt gab) -> Symptome
+# "Bricks lassen sich nicht hinzufuegen", "Motorstrom nicht aktivierbar",
+# "Sprachassistent startet nicht".
+_MIGRATION_SEEDED_TABLES = {
+    "voice_settings",
+    "llm_settings",
+    "app_settings",
+    "motion_capture_settings",
+    "movement_settings",
+}
+
+
 def _is_empty_db() -> bool:
     inspector = inspect(db.engine)
 
     for table in inspector.get_table_names():
-        if table == "alembic_version":
+        if table == "alembic_version" or table in _MIGRATION_SEEDED_TABLES:
             continue
         table_class = db.Model.metadata.tables[table]
         count = db.session.query(table_class).count()

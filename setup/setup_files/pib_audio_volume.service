@@ -1,0 +1,19 @@
+[Unit]
+Description=Sets pib's default audio output to 100% and unmutes it on each boot
+After=graphical.target sound.target
+
+[Service]
+# Ohne diesen Service steht die Ausgabelautstaerke auf einem frisch
+# installierten System oft deutlich unter 100% (oder auf dem falschen,
+# stummgeschalteten Sink) - die Sprachausgabe ist dann viel zu leise. Laeuft
+# als User pib gegen dessen PipeWire/PulseAudio-Session (XDG_RUNTIME_DIR).
+# Restart=on-failure, weil PipeWire beim Boot evtl. noch nicht bereit ist.
+User=pib
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/pactl set-sink-mute @DEFAULT_SINK@ 0
+ExecStartPost=/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ 100%
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

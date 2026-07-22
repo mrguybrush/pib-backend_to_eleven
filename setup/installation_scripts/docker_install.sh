@@ -15,9 +15,24 @@ version_gte() {
 # create a systemd-service that adds the 'local:'-host to the x-server's access-control-list on each startup,
 # allowing applications from within a docker container to access the x-server on the host os
 function create_xhost_service() {
-    sudo mv "$BACKEND_DIR/setup/setup_files/xhost_enable_local.service" /etc/systemd/xhost_enable_local.service
+    # cp statt mv: die Vorlage muss im Repo erhalten bleiben, sonst
+    # zerstoert der erste Install die Quelle und ein zweiter Install (oder
+    # ein frischer Clone auf einem anderen System) findet die Datei nicht
+    # mehr -> xhost-Service wird nie erstellt -> der ros-display-Container
+    # bekommt keinen Zugriff auf den X-Server und laeuft im Crash-Loop
+    # ("Authorization required, cannot connect to X server").
+    sudo cp "$BACKEND_DIR/setup/setup_files/xhost_enable_local.service" /etc/systemd/xhost_enable_local.service
     sudo chmod 700 /etc/systemd/xhost_enable_local.service
     sudo systemctl enable /etc/systemd/xhost_enable_local.service --now
+}
+
+# create a systemd-service that sets the default audio output to 100% and
+# unmutes it on each boot - a fresh install often starts far too quiet
+function create_audio_volume_service() {
+    sudo cp "$BACKEND_DIR/setup/setup_files/pib_audio_volume.service" /etc/systemd/system/pib_audio_volume.service
+    sudo chmod 644 /etc/systemd/system/pib_audio_volume.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable pib_audio_volume.service --now
 }
 
 
@@ -96,6 +111,7 @@ function start_container() {
 }
 
 create_xhost_service || print ERROR "failed to create service for xhost permission management"
+create_audio_volume_service || print ERROR "failed to create audio volume service"
 install_docker_engine || print ERROR "failed to install docker engine"
 start_container || print ERROR "failed to start containers"
 setup_docker_cleaner_service || print ERROR "failed to setup docker cleaner service"
