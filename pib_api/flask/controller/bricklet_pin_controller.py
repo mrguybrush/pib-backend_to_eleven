@@ -30,6 +30,20 @@ def set_pin_defective(bricklet_id: int, pin: int):
     return "", 204
 
 
+@bp.route("/export", methods=["GET"])
+def export_pin_assignment():
+    return jsonify(bricklet_pin_service.export_pin_assignment())
+
+
+@bp.route("/import", methods=["PUT"])
+def import_pin_assignment():
+    try:
+        bricklet_pin_service.import_pin_assignment(request.json or {})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return "", 204
+
+
 @bp.route("/restart-motors", methods=["POST"])
 def restart_motors():
     try:

@@ -3,7 +3,7 @@ from schema.bricklet_schema import (
     bricklet_schema,
     bricklets_schema,
 )
-from service import bricklet_service
+from service import bricklet_service, bricklet_discovery_service
 from flask import request, Blueprint, jsonify
 
 bp = Blueprint("bricklet_controller", __name__)
@@ -13,6 +13,17 @@ bp = Blueprint("bricklet_controller", __name__)
 def get_all_bricklets():
     bricklets = bricklet_service.get_all_bricklets()
     return jsonify({"bricklets": bricklets_schema.dump(bricklets)})
+
+
+@bp.route("/detected", methods=["GET"])
+def get_detected_bricklets():
+    """Live-Abfrage der tatsaechlich angeschlossenen Bricklets (inkl.
+    Steckposition) fuer die Hardware-IDs-Seite / Auto-Zuweisung."""
+    try:
+        detected = bricklet_discovery_service.get_detected_bricklets()
+    except Exception as e:  # noqa: BLE001 - dem Frontend eine Meldung geben
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"detectedBricklets": detected})
 
 
 @bp.route("/<string:bricklet_number>", methods=["GET"])

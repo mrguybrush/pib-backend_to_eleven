@@ -2,7 +2,7 @@ from typing import Optional
 
 from app.app import db
 from model.learning_group_model import AppSettings
-from service.container_control_service import restart_service_container
+from service.container_control_service import restart_service_container, reboot_host
 
 _SETTINGS_ID = 1
 
@@ -71,6 +71,11 @@ def restart_display_container() -> None:
     Augen nach dem Hochfahren nicht vollstaendig im Vollbild angezeigt
     werden."""
     restart_service_container(ROS_DISPLAY_SERVICE_NAME)
+
+
+def reboot_system() -> None:
+    """Startet den kompletten Raspberry Pi neu (nicht nur einen Container)."""
+    reboot_host()
 
 
 def _get_settings() -> AppSettings:

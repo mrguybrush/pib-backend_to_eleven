@@ -34,8 +34,24 @@ def seed_db() -> None:
     _create_chat_data_and_assistant()
     _create_default_poses()
     _create_button_program_data()
+    _set_default_movement_speed()
     db.session.commit()
     print("Seeded the database with default data.")
+
+
+def _set_default_movement_speed() -> None:
+    """Bei einer Neuinstallation soll pib zunaechst mit einem ruhigen
+    Grundtempo (40%) losfahren statt mit voller Geschwindigkeit. Die
+    movement_settings-Zeile wird von einer Migration mit 100% angelegt -
+    hier (nur beim Erst-Seeding einer leeren DB) auf 40% gesetzt.
+    max_speed_percent (Sicherheits-Obergrenze) bleibt bei 100% = keine
+    zusaetzliche Begrenzung."""
+    from model.movement_settings_model import MovementSettings
+
+    settings = MovementSettings.query.filter_by(id=1).first()
+    if settings is not None:
+        settings.speed_percent = 40
+    db.session.flush()
 
 
 # Tabellen, die von Migrationen mit einer Default-Singleton-Zeile (id=1)

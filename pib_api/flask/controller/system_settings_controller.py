@@ -50,3 +50,12 @@ def restart_display():
     except ValueError as e:
         return jsonify({"error": str(e)}), 500
     return "", 204
+
+
+@bp.route("/reboot", methods=["POST"])
+def reboot():
+    try:
+        system_settings_service.reboot_system()
+    except Exception as e:  # noqa: BLE001 - dem Frontend eine Meldung geben
+        return jsonify({"error": str(e)}), 500
+    return "", 204

@@ -23,11 +23,18 @@ services:
       - pib-network
     ports:
       - "5000:5000"
+    # Damit die flask-app die angeschlossenen Tinkerforge-Bricklets live
+    # abfragen kann (Hardware-IDs-Seite / Auto-Zuweisung) - brickd laeuft
+    # auf dem Host, erreichbar wie bei ros-motors ueber host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - SQLALCHEMY_DATABASE_URI=sqlite:////app/pibdata.db
       - PIB_BLOCKLY_SERVER_URL=http://pib-blockly-server:2442
       - VOICE_RECORDINGS_DIR=/data/voice_recordings
       - FACIAL_EXPRESSIONS_DIR=/data/facial_expressions
+      - TINKERFORGE_HOST=host.docker.internal
+      - TINKERFORGE_PORT=4223
     volumes:
       - ./pib_api/flask/:/app
       - programs:/root/cerebra_programs
