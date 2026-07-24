@@ -16,6 +16,12 @@ if is_supported_raspbian; then
         declare -A settingsMap=(
         ["hdmi_force_edid_audio"]="hdmi_force_edid_audio=1"
         ["max_usb_current"]="max_usb_current=1"
+        # Pi-5-Pendant zu max_usb_current (das ist die Pi-4-Firmware-Option):
+        # gibt den vollen USB-Strom frei (bis 1.6A/Port statt 600mA-Drossel),
+        # noetig mit dem offiziellen 27W/5A-Netzteil. Ohne das ist die
+        # USB-Schiene gedrosselt -> ReSpeaker-Mikro/-Lautsprecher und OAK-D
+        # bekommen zu wenig Strom (bis hin zu Absturz/Reboot beim Lastspitzen).
+        ["usb_max_current_enable"]="usb_max_current_enable=1"
         ["hdmi_force_hotplug"]="hdmi_force_hotplug=1"
         ["config_hdmi_boost"]="config_hdmi_boost=7"
         ["hdmi_group"]="hdmi_group=2"
