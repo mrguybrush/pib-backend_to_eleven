@@ -57,3 +57,8 @@ class AppSettings(db.Model):
     # normalen Augen zurueckgeschaltet wird. 0 = Overlay wird gar nicht
     # angezeigt.
     ip_overlay_seconds = db.Column(db.Integer, nullable=False, default=20)
+
+    # Ausgabelautstaerke des Roboters in Prozent (0-100), einstellbar ueber
+    # den Regler unter System. Wird beim Setzen sofort auf den Audio-Sink
+    # angewendet und beim Booten wiederhergestellt (pib_audio_volume.service).
+    volume_percent = db.Column(db.Integer, nullable=False, default=100)

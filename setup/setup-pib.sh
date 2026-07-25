@@ -286,6 +286,13 @@ function disable_power_notification() {
 
     	echo "Preventing CPU throttling..."
     	echo "force_turbo=1" | sudo tee -a "$file" > /dev/null
+
+    	# Pi 5: vollen USB-Strom freigeben (bis 1.6A/Port statt 600mA-Drossel).
+    	# Noetig mit dem 27W/5A-Netzteil, sonst bekommen ReSpeaker
+    	# (Mikro + Lautsprecher) und OAK-D zu wenig Strom (bis Absturz/Reboot).
+    	echo "Enabling full USB current (Pi 5)..."
+    	grep -q "^usb_max_current_enable=1" "$file" || \
+    		echo "usb_max_current_enable=1" | sudo tee -a "$file" > /dev/null
 	fi
 
 	echo "Installing and configuring watchdog service..."

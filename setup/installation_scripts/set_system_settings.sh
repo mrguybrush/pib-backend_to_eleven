@@ -9,7 +9,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable ssh --now
 
 if is_supported_raspbian; then
-    local CONFIG_FILE="/boot/firmware/config.txt"
+    # Kein 'local' hier: dieses Skript wird per 'source' auf Top-Level
+    # ausgefuehrt (nicht in einer Funktion) - 'local' bricht dort mit
+    # "local: can only be used in a function" ab, wodurch CONFIG_FILE leer
+    # bleibt und der GESAMTE config.txt-Block stillschweigend uebersprungen
+    # wurde (Display-/USB-Settings wurden nie angewandt).
+    CONFIG_FILE="/boot/firmware/config.txt"
 
     # Apply display and resolution settings if config file exists
     if [ -e "$CONFIG_FILE" ]; then
@@ -29,7 +34,10 @@ if is_supported_raspbian; then
         ["hdmi_drive"]="hdmi_drive=2"
         ["display_rotate"]="display_rotate=0"
         ["hdmi_cvt"]="hdmi_cvt 1024 600 60 6 0 0 0"
-        ["dtoverlay=vc4-kms-v3d"]="dtoverlay=vc4-fkms-v3d"
+        # KEIN Umschalten auf vc4-fkms-v3d mehr: FKMS ist auf dem Pi 5
+        # nicht unterstuetzt und wuerde die Anzeige zerschiessen - der
+        # Pi 5 braucht den KMS-Treiber (vc4-kms-v3d), der ohnehin schon in
+        # der config.txt steht. (Frueher: dtoverlay=vc4-kms-v3d -> fkms.)
         )
         for setting in "${!settingsMap[@]}"
         do

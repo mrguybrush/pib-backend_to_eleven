@@ -31,6 +31,21 @@ def set_ip_overlay_seconds():
     return jsonify({"ipOverlaySeconds": result})
 
 
+@bp.route("/volume", methods=["GET"])
+def get_volume():
+    return jsonify({"volumePercent": system_settings_service.get_volume_percent()})
+
+
+@bp.route("/volume", methods=["PUT"])
+def set_volume():
+    percent = (request.json or {}).get("volumePercent")
+    try:
+        result = system_settings_service.set_volume_percent(percent)
+    except Exception as e:  # noqa: BLE001 - dem Frontend eine Meldung geben
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"volumePercent": result})
+
+
 @bp.route("/menu-visibility", methods=["GET"])
 def get_menu_visibility():
     return jsonify(system_settings_service.get_menu_visibility())

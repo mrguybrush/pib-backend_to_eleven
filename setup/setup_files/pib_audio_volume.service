@@ -1,19 +1,21 @@
 [Unit]
-Description=Sets pib's default audio output to 100% and unmutes it on each boot
+Description=Restores pib's saved output volume and unmutes the audio on boot
 After=graphical.target sound.target
 
 [Service]
-# Ohne diesen Service steht die Ausgabelautstaerke auf einem frisch
-# installierten System oft deutlich unter 100% (oder auf dem falschen,
-# stummgeschalteten Sink) - die Sprachausgabe ist dann viel zu leise. Laeuft
-# als User pib gegen dessen PipeWire/PulseAudio-Session (XDG_RUNTIME_DIR).
-# Restart=on-failure, weil PipeWire beim Boot evtl. noch nicht bereit ist.
+# Wendet beim Boot die in der pib-API gespeicherte Lautstaerke
+# (system-settings/volume, Default 100%) auf den Default-Sink an und
+# entstummt ihn - so ist die Sprachausgabe nach dem Hochfahren hoerbar UND
+# die ueber den Regler unter System gewaehlte Lautstaerke bleibt erhalten
+# (statt bei jedem Boot auf 100% zurueckgesetzt zu werden).
+# Laeuft als User pib gegen dessen PipeWire-Session (XDG_RUNTIME_DIR).
+# Restart=on-failure + exit 1, solange flask-app/PipeWire noch nicht
+# bereit ist (curl liefert dann keinen Wert).
 User=pib
 Environment=XDG_RUNTIME_DIR=/run/user/1000
-ExecStart=/usr/bin/pactl set-sink-mute @DEFAULT_SINK@ 0
-ExecStartPost=/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ 100%
+ExecStart=/bin/bash -c 'vol=$(curl -sf http://localhost:5000/system-settings/volume | grep -oE "[0-9]+" | head -1); [ -z "$vol" ] && exit 1; /usr/bin/pactl set-sink-mute @DEFAULT_SINK@ 0; /usr/bin/pactl set-sink-volume @DEFAULT_SINK@ "$vol%"'
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target

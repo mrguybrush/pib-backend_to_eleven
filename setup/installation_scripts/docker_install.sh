@@ -101,12 +101,31 @@ function setup_docker_cleaner_service() {
     print SUCCESS "Docker container cleanup service installed and started"
 }
 
+# Ruft 'docker compose ... up -d' mit bis zu 3 Versuchen auf. Der Bau muss
+# die Basis-Images (python/node/ros) aus der Registry ziehen; das schlaegt
+# auf manchen Netzen sporadisch fehl (z.B. "network is unreachable", wenn
+# der Pi eine IPv6-Adresse hat, das Netz IPv6 aber nicht routet - Docker
+# probiert dann IPv6 und bricht ab). Ein Retry faengt transiente Faelle ab.
+function docker_compose_up_retry() {
+    local compose_file="$1"
+    shift
+    local attempt
+    for attempt in 1 2 3; do
+        if sudo docker compose -f "$compose_file" "$@" up -d; then
+            return 0
+        fi
+        print WARN "docker compose up fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."
+        sleep 15
+    done
+    return 1
+}
+
 function start_container() {
     print INFO "Starting container"
     echo "TRYB_URL_PREFIX=https://platform.tryb.ai" > "$BACKEND_DIR"/password.env
-    sudo docker compose -f "$BACKEND_DIR/docker-compose.yaml" --profile all up -d || return 1
+    docker_compose_up_retry "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1
     print SUCCESS "Started pib-backend container"
-    sudo docker compose -f "$FRONTEND_DIR/docker-compose.yaml" up -d || return 1
+    docker_compose_up_retry "$FRONTEND_DIR/docker-compose.yaml" || return 1
     print SUCCESS "Started cerebra container"
 }
 
@@ -115,4 +134,10 @@ create_audio_volume_service || print ERROR "failed to create audio volume servic
 install_docker_engine || print ERROR "failed to install docker engine"
 start_container || print ERROR "failed to start containers"
 setup_docker_cleaner_service || print ERROR "failed to setup docker cleaner service"
-sudo chmod 777 "$BACKEND_DIR/pib_api/flask/pibdata.db"
+# Die DB wird von flask-app beim ersten Start angelegt (Bind-Mount). Nur
+# chmod'en, wenn sie schon da ist - sonst bricht der Install mit
+# "No such file or directory" ab, falls der Container-Build/-Start (noch)
+# nicht durchlief.
+if [ -f "$BACKEND_DIR/pib_api/flask/pibdata.db" ]; then
+    sudo chmod 777 "$BACKEND_DIR/pib_api/flask/pibdata.db"
+fi

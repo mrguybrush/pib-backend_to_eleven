@@ -2,7 +2,11 @@ from typing import Optional
 
 from app.app import db
 from model.learning_group_model import AppSettings
-from service.container_control_service import restart_service_container, reboot_host
+from service.container_control_service import (
+    restart_service_container,
+    reboot_host,
+    set_host_volume,
+)
 
 _SETTINGS_ID = 1
 
@@ -47,6 +51,23 @@ def set_ip_overlay_seconds(seconds: int) -> int:
     settings.ip_overlay_seconds = seconds
     db.session.flush()
     return settings.ip_overlay_seconds
+
+
+def get_volume_percent() -> int:
+    return _get_settings().volume_percent
+
+
+def set_volume_percent(percent: int) -> int:
+    """Speichert die Lautstaerke (0-100) und wendet sie sofort auf den
+    Audio-Sink des Roboters an. Schlaegt das Anwenden fehl (z.B. Audio
+    nicht bereit), wird der Wert trotzdem persistiert - beim naechsten Boot
+    setzt pib_audio_volume.service ihn erneut."""
+    percent = max(0, min(100, int(percent)))
+    settings = _get_settings()
+    settings.volume_percent = percent
+    db.session.flush()
+    set_host_volume(percent)
+    return percent
 
 
 def get_menu_visibility() -> dict:
