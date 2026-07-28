@@ -160,6 +160,43 @@ function install_locale() {
   export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 }
 
+# Clone a repo to $dir, or if $dir already contains a git checkout, bring it
+# in line with $repo_url/$branch instead of silently leaving it untouched.
+#
+# Bug this fixes: a plain 'git clone ... "$dir" || print WARN "already exists"'
+# no-ops whenever $dir is already present - e.g. a pib that was previously set
+# up from a *different* fork/remote (or an older checkout of this one) keeps
+# running that stale code forever, because the warning is easy to miss in the
+# install log and nothing actually updates the checkout. That is exactly how a
+# robot ends up running an old version after re-running this script.
+function clone_or_update_repo() {
+  local repo_url="$1"
+  local branch="$2"
+  local dir="$3"
+  local label="$4"
+
+  if [ -d "$dir/.git" ]; then
+    local current_origin
+    current_origin="$(git -C "$dir" remote get-url origin 2>/dev/null)"
+    if [ "$current_origin" != "$repo_url" ]; then
+      print WARN "$label at $dir points to '$current_origin' instead of '$repo_url' - removing and re-cloning"
+      rm -rf "$dir"
+      git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+    else
+      print INFO "$label already checked out at $dir - fetching and resetting to origin/$branch"
+      git -C "$dir" fetch origin "$branch" || { print ERROR "failed to fetch $label"; return 1; }
+      git -C "$dir" checkout "$branch" || { print ERROR "failed to checkout '$branch' for $label"; return 1; }
+      git -C "$dir" reset --hard "origin/$branch" || { print ERROR "failed to reset $label to origin/$branch"; return 1; }
+    fi
+  elif [ -e "$dir" ]; then
+    print WARN "$dir exists but is not a git checkout - removing and cloning $label"
+    rm -rf "$dir"
+    git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+  else
+    git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+  fi
+}
+
 # function to clone pib repositories to APP_DIR (~/app) directory
 function clone_repositories() {
   # Validate branches
@@ -185,8 +222,8 @@ function clone_repositories() {
     print INFO "${APP_DIR} created"
   fi
 
-  git clone -b "$BRANCH_BACKEND" $BACKEND "$BACKEND_DIR" || print WARN "pib-backend repository already exists"
-  git clone -b "$BRANCH_FRONTEND" $FRONTEND "$FRONTEND_DIR" || print WARN "cerebra repository already exists"
+  clone_or_update_repo "$BACKEND" "$BRANCH_BACKEND" "$BACKEND_DIR" "pib-backend" || exit 1
+  clone_or_update_repo "$FRONTEND" "$BRANCH_FRONTEND" "$FRONTEND_DIR" "cerebra" || exit 1
 
   print SUCCESS "Completed cloning repositories to $APP_DIR"
 }

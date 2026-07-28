@@ -111,7 +111,17 @@ function docker_compose_up_retry() {
     shift
     local attempt
     for attempt in 1 2 3; do
-        if sudo docker compose -f "$compose_file" "$@" up -d; then
+        # --build: ohne dieses Flag benutzt "up -d" ein bereits vorhandenes
+        # Image unveraendert weiter, auch wenn sich die Quelle (z.B. durch
+        # clone_or_update_repo) geaendert hat - das war die Ursache dafuer,
+        # dass nach einem erneuten Setup-Lauf weiterhin eine alte Version lief.
+        # --force-recreate: erzwingt einen Container-Neustart auch fuer
+        # Services, deren Image sich nicht geaendert hat (z.B. das Frontend),
+        # damit sie z.B. den Hostnamen eines gerade neu gebauten Backend-
+        # Containers frisch aufloesen, statt dessen alte Docker-interne IP
+        # weiter zu benutzen (nginx cached die Aufloesung sonst fuer die
+        # gesamte Prozesslaufzeit).
+        if sudo docker compose -f "$compose_file" "$@" up -d --build --force-recreate; then
             return 0
         fi
         print WARN "docker compose up fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."

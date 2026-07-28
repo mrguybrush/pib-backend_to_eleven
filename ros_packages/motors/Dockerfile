@@ -6,8 +6,13 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install --no-install-recommends -y curl
 
-RUN curl -sSL https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID)/tinkerforge.gpg | apt-key add - && \
-    echo "deb https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
+# --retry-all-errors: curl's default --retry only retries timeouts/5xx, not a
+# transient DNS lookup failure (exit code 6) - that's the exact failure this
+# was hitting under concurrent build load on low-power hosts (e.g. Raspberry
+# Pi building several images in parallel saturates network/DNS momentarily).
+# signed-by keyring instead of the deprecated/removed 'apt-key add'.
+RUN curl --retry 5 --retry-all-errors --retry-delay 5 -sSL https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID)/tinkerforge.gpg -o /usr/share/keyrings/tinkerforge.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/tinkerforge.gpg] https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
     apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y \
         build-essential \
