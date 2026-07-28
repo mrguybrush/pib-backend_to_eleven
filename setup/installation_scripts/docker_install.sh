@@ -111,6 +111,13 @@ function docker_compose_up_retry() {
     shift
     local attempt
     for attempt in 1 2 3; do
+        # COMPOSE_PARALLEL_LIMIT: das Compose-File hat 9+ Services mit eigenem
+        # build-Kontext; ohne Limit baut Compose sie alle gleichzeitig. Auf
+        # einem Raspberry Pi (4 Kerne/4GB RAM) wurde dabei ein einzelner
+        # "apt install" ueber eine Stunde und ein "colcon build" fuer 2 Pakete
+        # 21 Minuten gebraucht (statt Sekunden) - die Kiste war schlicht
+        # ueberlastet. 2 gleichzeitige Builds halten CPU/RAM/Netz in einem
+        # Bereich, in dem die einzelnen Schritte nicht verhungern.
         # --build: ohne dieses Flag benutzt "up -d" ein bereits vorhandenes
         # Image unveraendert weiter, auch wenn sich die Quelle (z.B. durch
         # clone_or_update_repo) geaendert hat - das war die Ursache dafuer,
@@ -121,7 +128,7 @@ function docker_compose_up_retry() {
         # Containers frisch aufloesen, statt dessen alte Docker-interne IP
         # weiter zu benutzen (nginx cached die Aufloesung sonst fuer die
         # gesamte Prozesslaufzeit).
-        if sudo docker compose -f "$compose_file" "$@" up -d --build --force-recreate; then
+        if sudo env COMPOSE_PARALLEL_LIMIT=2 docker compose -f "$compose_file" "$@" up -d --build --force-recreate; then
             return 0
         fi
         print WARN "docker compose up fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."
