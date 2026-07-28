@@ -178,22 +178,34 @@ function clone_or_update_repo() {
   if [ -d "$dir/.git" ]; then
     local current_origin
     current_origin="$(git -C "$dir" remote get-url origin 2>/dev/null)"
-    if [ "$current_origin" != "$repo_url" ]; then
-      print WARN "$label at $dir points to '$current_origin' instead of '$repo_url' - removing and re-cloning"
-      rm -rf "$dir"
-      git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
-    else
+    if [ "$current_origin" = "$repo_url" ]; then
       print INFO "$label already checked out at $dir - fetching and resetting to origin/$branch"
       git -C "$dir" fetch origin "$branch" || { print ERROR "failed to fetch $label"; return 1; }
       git -C "$dir" checkout "$branch" || { print ERROR "failed to checkout '$branch' for $label"; return 1; }
       git -C "$dir" reset --hard "origin/$branch" || { print ERROR "failed to reset $label to origin/$branch"; return 1; }
+      return 0
     fi
+    print WARN "$label at $dir points to '$current_origin' instead of '$repo_url' - moving aside and re-cloning"
   elif [ -e "$dir" ]; then
-    print WARN "$dir exists but is not a git checkout - removing and cloning $label"
-    rm -rf "$dir"
-    git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+    print WARN "$dir exists but is not a git checkout for $label - moving aside and re-cloning"
   else
     git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+    return 0
+  fi
+
+  # Move the stale checkout aside instead of deleting it outright - it may
+  # still hold runtime state (e.g. pib-backend's SQLite DB) that isn't
+  # tracked by git and would otherwise be lost for good.
+  local backup_dir
+  backup_dir="${dir}.stale.$(date +%Y%m%d%H%M%S)"
+  mv "$dir" "$backup_dir"
+  git clone -b "$branch" "$repo_url" "$dir" || { print ERROR "failed to clone $label"; return 1; }
+
+  local db_file="pib_api/flask/pibdata.db"
+  if [ -f "$backup_dir/$db_file" ] && [ ! -f "$dir/$db_file" ]; then
+    mkdir -p "$(dirname "$dir/$db_file")"
+    cp "$backup_dir/$db_file" "$dir/$db_file"
+    print INFO "Restored existing pibdata.db from $backup_dir into fresh $label checkout"
   fi
 }
 
