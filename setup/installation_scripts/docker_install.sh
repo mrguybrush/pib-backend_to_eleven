@@ -101,34 +101,53 @@ function setup_docker_cleaner_service() {
     print SUCCESS "Docker container cleanup service installed and started"
 }
 
-# Ruft 'docker compose ... up -d' mit bis zu 3 Versuchen auf. Der Bau muss
-# die Basis-Images (python/node/ros) aus der Registry ziehen; das schlaegt
-# auf manchen Netzen sporadisch fehl (z.B. "network is unreachable", wenn
-# der Pi eine IPv6-Adresse hat, das Netz IPv6 aber nicht routet - Docker
-# probiert dann IPv6 und bricht ab). Ein Retry faengt transiente Faelle ab.
+# Baut jeden Compose-Service einzeln nacheinander statt in einem einzigen
+# "docker compose build" - Compose V2 buendelt einen Multi-Service-Build zu
+# EINEM Aufruf an BuildKit/buildx, das die Ziele weitgehend selbst und
+# parallel einplant; COMPOSE_PARALLEL_LIMIT wirkt darauf nicht (das begrenzt
+# nur Nicht-Build-Operationen wie "up"/"pull"). Auf einem Raspberry Pi kam es
+# dadurch trotz gesetztem Limit zu 6+ gleichzeitigen Builds - Folge waren
+# teils >1h fuer einzelne apt-Schritte und ein BuildKit/containerd-Fehler
+# ("failed call to UtimesNanoAt ... no such file or directory", eine
+# Snapshot-Race unter Storage-Last), der nach 3 vollen Versuchen den
+# kompletten Start scheitern liess (0 Container liefen). Ein Service pro
+# "docker compose build <name>"-Aufruf ist die einzige Garantie fuer
+# echte Sequenzialitaet.
+function docker_compose_build_sequential() {
+    local compose_file="$1"
+    shift
+    local service services
+    services="$(sudo docker compose -f "$compose_file" "$@" config --services)" \
+        || { print ERROR "konnte Service-Liste aus $compose_file nicht lesen"; return 1; }
+
+    for service in $services; do
+        local attempt built=0
+        for attempt in 1 2 3; do
+            if sudo docker compose -f "$compose_file" "$@" build "$service"; then
+                built=1
+                break
+            fi
+            print WARN "Build von '$service' fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."
+            sleep 15
+        done
+        [ "$built" = "1" ] || { print ERROR "Build von '$service' nach 3 Versuchen fehlgeschlagen"; return 1; }
+    done
+}
+
+# Startet Container ueber bereits gebaute Images (kein --build hier - das
+# passiert vorher sequentiell in docker_compose_build_sequential). Bis zu 3
+# Versuche, falls z.B. ein Container beim ersten Start noch auf einen
+# anderen wartet. --force-recreate erzwingt einen Neustart auch fuer
+# Services, deren Image sich nicht geaendert hat (z.B. das Frontend), damit
+# sie z.B. den Hostnamen eines gerade neu gebauten Backend-Containers frisch
+# aufloesen statt dessen alte Docker-interne IP weiter zu benutzen (nginx
+# cached die Aufloesung sonst fuer die gesamte Prozesslaufzeit).
 function docker_compose_up_retry() {
     local compose_file="$1"
     shift
     local attempt
     for attempt in 1 2 3; do
-        # COMPOSE_PARALLEL_LIMIT: das Compose-File hat 9+ Services mit eigenem
-        # build-Kontext; ohne Limit baut Compose sie alle gleichzeitig. Auf
-        # einem Raspberry Pi (4 Kerne/4GB RAM) wurde dabei ein einzelner
-        # "apt install" ueber eine Stunde und ein "colcon build" fuer 2 Pakete
-        # 21 Minuten gebraucht (statt Sekunden) - die Kiste war schlicht
-        # ueberlastet. 2 gleichzeitige Builds halten CPU/RAM/Netz in einem
-        # Bereich, in dem die einzelnen Schritte nicht verhungern.
-        # --build: ohne dieses Flag benutzt "up -d" ein bereits vorhandenes
-        # Image unveraendert weiter, auch wenn sich die Quelle (z.B. durch
-        # clone_or_update_repo) geaendert hat - das war die Ursache dafuer,
-        # dass nach einem erneuten Setup-Lauf weiterhin eine alte Version lief.
-        # --force-recreate: erzwingt einen Container-Neustart auch fuer
-        # Services, deren Image sich nicht geaendert hat (z.B. das Frontend),
-        # damit sie z.B. den Hostnamen eines gerade neu gebauten Backend-
-        # Containers frisch aufloesen, statt dessen alte Docker-interne IP
-        # weiter zu benutzen (nginx cached die Aufloesung sonst fuer die
-        # gesamte Prozesslaufzeit).
-        if sudo env COMPOSE_PARALLEL_LIMIT=2 docker compose -f "$compose_file" "$@" up -d --build --force-recreate; then
+        if sudo docker compose -f "$compose_file" "$@" up -d --force-recreate; then
             return 0
         fi
         print WARN "docker compose up fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."
@@ -140,8 +159,10 @@ function docker_compose_up_retry() {
 function start_container() {
     print INFO "Starting container"
     echo "TRYB_URL_PREFIX=https://platform.tryb.ai" > "$BACKEND_DIR"/password.env
+    docker_compose_build_sequential "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1
     docker_compose_up_retry "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1
     print SUCCESS "Started pib-backend container"
+    docker_compose_build_sequential "$FRONTEND_DIR/docker-compose.yaml" || return 1
     docker_compose_up_retry "$FRONTEND_DIR/docker-compose.yaml" || return 1
     print SUCCESS "Started cerebra container"
 }
