@@ -12,7 +12,7 @@ from rclpy.duration import Duration
 
 from threading import Lock, Thread
 from queue import Queue
-from subprocess import Popen, PIPE
+from subprocess import Popen, PIPE, TimeoutExpired
 from typing import IO, Tuple
 import time
 import tempfile
@@ -31,6 +31,14 @@ UNBUFFERED_OUTPUT_FLAG: str = "-u"
 PROGRAM_DIR: str = os.getenv("PROGRAM_DIR", "/home/pib/cerebra_programs")
 
 ACTION_LOOP_WAITING_PERIOD_SECONDS: float = 0.05
+
+# How long a cancelled program's process gets to exit after SIGTERM before
+# being force-killed. rclpy installs its own SIGTERM handling, which can
+# leave a process blocked forever in calls like wait_for_service() instead
+# of actually exiting - SIGTERM alone then never terminates it, so pressing
+# "Stop" looked like it did nothing and starting a new program left both
+# running (and controlling the robot) simultaneously.
+TERMINATE_GRACE_PERIOD_SECONDS: float = 2.0
 
 
 class ProgramNode(Node):
@@ -85,6 +93,22 @@ class ProgramNode(Node):
         self.process_lock = Lock()
 
         self.get_logger().info("Now Running PROGRAM")
+
+    def terminate_process(self, process: Popen) -> None:
+        """Sends SIGTERM and waits briefly for the process to actually
+        exit; force-kills it (SIGKILL, uncatchable) if it hasn't by then.
+        See TERMINATE_GRACE_PERIOD_SECONDS for why SIGTERM alone isn't
+        always enough."""
+        process.terminate()
+        try:
+            process.wait(timeout=TERMINATE_GRACE_PERIOD_SECONDS)
+        except TimeoutExpired:
+            self.get_logger().warn(
+                f"process {process.pid} did not exit after SIGTERM within "
+                f"{TERMINATE_GRACE_PERIOD_SECONDS}s, sending SIGKILL"
+            )
+            process.kill()
+            process.wait()
 
     def clear_playback_queue(self) -> None:
         """abort any speech-output that is currently playing or queued"""
@@ -204,7 +228,7 @@ class ProgramNode(Node):
                 # if cancellation of the goal if requested, terminate the process
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
-                    process.terminate()
+                    self.terminate_process(process)
                     self.clear_playback_queue()
                     return RunProgram.Result(exit_code=2)
 

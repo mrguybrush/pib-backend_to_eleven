@@ -7,7 +7,7 @@ from rclpy.service import Service
 from rclpy.executors import SingleThreadedExecutor
 from pib_api_client import system_settings_client
 from pib_motors.bricklet import set_ssr_state, solid_state_relay_bricklet
-from pib_motors.motor import motors
+from pib_motors.motor import Motor, motors
 from pib_motors.resting_pose import apply_resting_pose
 from datatypes.msg import SolidStateRelayState
 from datatypes.srv import SetSolidStateRelay
@@ -139,12 +139,23 @@ class RelayControl(Node):
                 # Pre-position all servos at the resting pose while they are
                 # still unpowered: the moment power comes on, everything
                 # moves gently into the resting pose at once - replaces the
-                # old one-motor-at-a-time startup choreography.
+                # old one-motor-at-a-time startup choreography. Throttled
+                # (see Motor.POWER_ON_SPEED_PERCENT) so "gently" is actually
+                # true.
                 self.get_logger().info(
                     "pre-positioning resting pose, then powering servos on"
                 )
+                previous_speed_percent = Motor.movement_speed_percent
+                Motor.set_movement_speed_percent(Motor.POWER_ON_SPEED_PERCENT)
                 apply_resting_pose(motors, self.get_logger().warn)
                 set_ssr_state(True)
+                # Restoring right away is safe: the throttled
+                # velocity/acceleration/deceleration was already written to
+                # each bricklet above, before power-on, so this positioning
+                # move stays slow regardless. The restored (normal) speed
+                # only takes effect on each motor's NEXT move (lazily
+                # re-applied in Motor._ensure_scaled_motion_config).
+                Motor.set_movement_speed_percent(previous_speed_percent)
             else:
                 # Park the robot before cutting power: command the resting
                 # pose while still powered, give the servos time to actually

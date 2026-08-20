@@ -106,14 +106,22 @@ class MotorControl(Node):
             Motor.set_movement_speed_percent(movement_settings_dto["speedPercent"])
 
         # Load motor settings exactly as stored (incl. turnedOn), then
-        # pre-position everything at the resting pose. The servos are
-        # normally unpowered at this point (solid state relay off), so
-        # nothing physically moves yet - but the moment relay_control.py
-        # powers them on, all motors settle gently into the resting pose
-        # simultaneously. This replaces the old StartupPoseExecutor, whose
-        # one-motor-at-a-time choreography took long and was disliked;
-        # relay_control.py re-applies the resting pose on every power
-        # on/off cycle (see its update_relay_state).
+        # pre-position everything at the resting pose. Usually the servos
+        # are unpowered at this point (solid state relay off), so nothing
+        # physically moves yet - but the moment relay_control.py powers them
+        # on, all motors settle gently into the resting pose simultaneously.
+        # This replaces the old StartupPoseExecutor, whose one-motor-at-a-
+        # time choreography took long and was disliked; relay_control.py
+        # re-applies the resting pose on every power on/off cycle (see its
+        # update_relay_state).
+        # BUT: if this container restarts (crash, manual restart, ...) while
+        # the relay was already ON - e.g. relay_control.py's own
+        # poll_relay_state() finding the physical relay already closed -
+        # this positioning move applies directly to already-powered servos,
+        # same danger as the deliberate power-on case. Throttled the same
+        # way for that reason (movement_speed_percent resets to its 100%
+        # class default on every fresh process start, so this must be
+        # re-applied here, not just in relay_control.py).
         if not self.dev:
             for motor in motors:
                 if motor.check_if_motor_is_connected():
@@ -122,7 +130,10 @@ class MotorControl(Node):
                     )
                     if successful:
                         motor.apply_settings(motor_settings_dto)
+            previous_speed_percent = Motor.movement_speed_percent
+            Motor.set_movement_speed_percent(Motor.POWER_ON_SPEED_PERCENT)
             apply_resting_pose(motors, self.get_logger().warn)
+            Motor.set_movement_speed_percent(previous_speed_percent)
 
         # Log that initialization is complete
         self.get_logger().info("Now Running MOTOR_CONTROL")

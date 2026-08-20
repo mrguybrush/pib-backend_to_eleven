@@ -14,6 +14,15 @@ class Motor:
     # set_movement_speed_percent().
     movement_speed_percent: int = 100
 
+    # Used by relay_control.py/motor_control.py to throttle movement_speed_percent
+    # just for a resting-pose positioning move. apply_resting_pose() writes the
+    # target position to the bricklets before the servos are known to be at
+    # that position (either because the relay is about to close, or because
+    # the servos may already be powered when this container (re)starts) - at
+    # the normal (up to 100%) speed that looked like the servos "racing" into
+    # position, which is dangerous if a hand is near a joint.
+    POWER_ON_SPEED_PERCENT: int = 25
+
     def __init__(
         self,
         name: str,
