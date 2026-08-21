@@ -113,14 +113,27 @@ function setup_docker_cleaner_service() {
 # kompletten Start scheitern liess (0 Container liefen). Ein Service pro
 # "docker compose build <name>"-Aufruf ist die einzige Garantie fuer
 # echte Sequenzialitaet.
+# phase_label: nur fuer die Fortschrittsanzeige ("Backend"/"Frontend").
+# guessed_count: setup-pib.sh's grobe Schaetzung fuer diese Phase (siehe
+# dessen initiales progress_start) - wird hier auf den echten Wert korrigiert.
 function docker_compose_build_sequential() {
     local compose_file="$1"
-    shift
+    local phase_label="$2"
+    local guessed_count="$3"
+    shift 3
     local service services
     services="$(sudo docker compose -f "$compose_file" "$@" config --services)" \
         || { print ERROR "konnte Service-Liste aus $compose_file nicht lesen"; return 1; }
 
+    # Die tatsaechliche Service-Anzahl ist erst jetzt bekannt (braucht die
+    # geklonten Repos + Docker) - progress_step haelt die Anzeige unabhaengig
+    # davon monoton steigend, auch wenn die Korrektur die Schaetzung uebertrifft.
+    local count
+    count="$(echo "$services" | wc -w)"
+    progress_add_total "$((count - guessed_count))"
+
     for service in $services; do
+        progress_step "Baue $service ($phase_label)"
         local attempt built=0
         for attempt in 1 2 3; do
             if sudo docker compose -f "$compose_file" "$@" build "$service"; then
@@ -159,19 +172,26 @@ function docker_compose_up_retry() {
 function start_container() {
     print INFO "Starting container"
     echo "TRYB_URL_PREFIX=https://platform.tryb.ai" > "$BACKEND_DIR"/password.env
-    docker_compose_build_sequential "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1
+    docker_compose_build_sequential "$BACKEND_DIR/docker-compose.yaml" "Backend" 10 --profile all || return 1
+    progress_step "Backend-Container starten"
     docker_compose_up_retry "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1
     print SUCCESS "Started pib-backend container"
-    docker_compose_build_sequential "$FRONTEND_DIR/docker-compose.yaml" || return 1
+    docker_compose_build_sequential "$FRONTEND_DIR/docker-compose.yaml" "Frontend" 1 || return 1
+    progress_step "Cerebra-Container starten"
     docker_compose_up_retry "$FRONTEND_DIR/docker-compose.yaml" || return 1
     print SUCCESS "Started cerebra container"
 }
 
+progress_step "X-Server-Zugriff fuer Docker einrichten"
 create_xhost_service || print ERROR "failed to create service for xhost permission management"
+progress_step "Lautstaerke-Dienst einrichten"
 create_audio_volume_service || print ERROR "failed to create audio volume service"
+progress_step "Docker Engine installieren"
 install_docker_engine || print ERROR "failed to install docker engine"
 start_container || print ERROR "failed to start containers"
+progress_step "Docker-Aufraeumdienst einrichten"
 setup_docker_cleaner_service || print ERROR "failed to setup docker cleaner service"
+progress_step "Datenbank-Berechtigungen setzen"
 # Die DB wird von flask-app beim ersten Start angelegt (Bind-Mount). Nur
 # chmod'en, wenn sie schon da ist - sonst bricht der Install mit
 # "No such file or directory" ab, falls der Container-Build/-Start (noch)

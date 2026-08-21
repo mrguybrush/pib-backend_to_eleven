@@ -43,6 +43,104 @@ function command_exists() {
     command -v "$@" >/dev/null 2>&1
 }
 
+# --- Grafische Fortschrittsanzeige (whiptail) -------------------------------
+# Zeigt eine Fortschrittsleiste mit dem aktuellen Installationsschritt statt
+# einer Wand aus rohem apt/docker-Output, und baut alles nacheinander statt
+# gleichzeitig auf (siehe docker_compose_build_sequential in
+# docker_install.sh). Faellt automatisch auf reines Text-Logging zurueck,
+# wenn whiptail fehlt oder kein echtes Terminal vorhanden ist (z.B. wenn das
+# Skript per "nohup ... &" ohne tty im Hintergrund laeuft).
+PROGRESS_ENABLED=0
+PROGRESS_TOTAL=0
+PROGRESS_CURRENT=0
+PROGRESS_MAX_SHOWN=0
+PROGRESS_FIFO=""
+PROGRESS_WHIPTAIL_PID=""
+
+function progress_supported() {
+  # NICHT "[ -t 1 ]" verwenden: stdout ist zu diesem Zeitpunkt schon per
+  # "exec > >(tee -a $LOG_FILE) 2>&1" (siehe oben) auf eine Pipe umgeleitet,
+  # also ist fd 1 nie ein Terminal, selbst in einer echten interaktiven
+  # Sitzung. Whiptail zeichnet ohnehin direkt auf /dev/tty (siehe
+  # progress_start) - massgeblich ist also, ob ueberhaupt ein steuerndes
+  # Terminal existiert, nicht was fd 1 gerade ist.
+  command_exists whiptail && { : </dev/tty; } 2>/dev/null
+}
+
+# progress_start <geschaetzte_gesamtschritte>
+# Die genaue Schrittzahl steht erst fest, wenn die Docker-Compose-Services
+# bekannt sind (nach clone_repositories + install_docker_engine); bis dahin
+# reicht eine grobe Schaetzung, progress_add_total korrigiert sie spaeter.
+# progress_step haelt die Anzeige unabhaengig davon monoton steigend.
+function progress_start() {
+  PROGRESS_TOTAL="$1"
+  PROGRESS_CURRENT=0
+  PROGRESS_MAX_SHOWN=0
+
+  if ! progress_supported; then
+    PROGRESS_ENABLED=0
+    return 0
+  fi
+
+  PROGRESS_ENABLED=1
+  PROGRESS_FIFO="$(mktemp -u)"
+  mkfifo "$PROGRESS_FIFO"
+  exec 3<>"$PROGRESS_FIFO"
+
+  # whiptail schreibt direkt auf /dev/tty statt auf fd 1/2, damit es
+  # unabhaengig davon funktioniert, dass wir gleich unser eigenes stdout/
+  # stderr auf die Log-Datei umlenken.
+  whiptail --title "pib Setup" --gauge "Installation wird vorbereitet..." 10 70 0 <&3 >/dev/tty 2>/dev/tty &
+  PROGRESS_WHIPTAIL_PID=$!
+
+  # Ab hier nur noch die Log-Datei fuellen - das Terminal gehoert bis
+  # progress_end allein der Gauge-Box, sonst wuerde rohes apt/docker-Output
+  # die Anzeige zerreissen. fd 4/5 sichern das bisherige stdout/stderr
+  # (den "tee -a $LOG_FILE" von weiter oben) fuer die Wiederherstellung.
+  exec 4>&1 5>&2
+  exec 1>>"$LOG_FILE" 2>&1
+}
+
+# progress_add_total <delta> - erweitert die Gesamtschrittzahl nachtraeglich
+# (z.B. sobald die tatsaechliche Anzahl Docker-Services bekannt ist), ohne
+# dass die Anzeige dadurch zurueckspringt.
+function progress_add_total() {
+  PROGRESS_TOTAL=$((PROGRESS_TOTAL + $1))
+}
+
+# progress_step "<Beschreibung>" - ein Schritt weiter, aktualisiert Balken
+# und Beschriftung. Schreibt die Beschreibung immer auch ins Log, damit man
+# im Log genauso nachvollziehen kann, was gerade installiert wurde.
+function progress_step() {
+  local label="$1"
+  PROGRESS_CURRENT=$((PROGRESS_CURRENT + 1))
+  local percent=0
+  if [ "$PROGRESS_TOTAL" -gt 0 ]; then
+    percent=$(( PROGRESS_CURRENT * 100 / PROGRESS_TOTAL ))
+  fi
+  [ "$percent" -gt 100 ] && percent=100
+  [ "$percent" -lt "$PROGRESS_MAX_SHOWN" ] && percent=$PROGRESS_MAX_SHOWN
+  PROGRESS_MAX_SHOWN=$percent
+
+  echo "[$(date -u)][[ (${PROGRESS_CURRENT}/${PROGRESS_TOTAL}) ${label} ]]"
+
+  if [ "$PROGRESS_ENABLED" = "1" ]; then
+    { echo "XXX"; echo "$percent"; echo "$label"; echo "XXX"; } >&3
+  fi
+}
+
+function progress_end() {
+  [ "$PROGRESS_ENABLED" = "1" ] || return 0
+  { echo "XXX"; echo 100; echo "Fertig"; echo "XXX"; } >&3
+  sleep 1
+  exec 3>&-
+  wait "$PROGRESS_WHIPTAIL_PID" 2>/dev/null
+  rm -f "$PROGRESS_FIFO"
+  exec 1>&4 2>&5
+  exec 4>&- 5>&-
+  PROGRESS_ENABLED=0
+}
+
 # Get Linux distribution name, e.g. 'ubuntu', 'debian'
 get_distribution() {
     local distribution=""
@@ -267,16 +365,32 @@ function install_imitation() {
     return 1
   fi
 
-  print INFO "Cloning imitation project to $IMITATION_DIR"
-  git clone "$IMITATION" "$IMITATION_DIR" || print WARN "imitation repository already exists"
+  # Wie clone_or_update_repo (siehe dort): ein blosses "git clone ||
+  # print WARN" no-opt beim zweiten Lauf und liesse die imitation-Kopie
+  # dauerhaft veraltet, statt sie zu aktualisieren.
+  if [ -d "$IMITATION_DIR/.git" ]; then
+    print INFO "imitation project already cloned at $IMITATION_DIR - pulling latest"
+    git -C "$IMITATION_DIR" pull --ff-only \
+      || print WARN "failed to update imitation project, continuing with existing checkout"
+  else
+    print INFO "Cloning imitation project to $IMITATION_DIR"
+    git clone "$IMITATION" "$IMITATION_DIR" || { print ERROR "failed to clone imitation project"; return 1; }
+  fi
 
   # venv tooling is not guaranteed to be present on a fresh system
   sudo apt-get install -y python3-venv python3-pip
 
-  # Create the venv with access to the system ROS packages (rclpy, datatypes,
-  # trajectory_msgs) which are provided by the ROS overlay, not pip.
-  python3 -m venv --system-site-packages "$IMITATION_DIR/.venv" \
-    || { print ERROR "failed to create imitation virtual environment"; return 1; }
+  # Ein zweiter Lauf muss die venv nicht neu anlegen, wenn sie schon
+  # funktioniert - "python3 -m venv" auf einem bestehenden Verzeichnis ist
+  # zwar meist unschaedlich, aber unnoetig langsam.
+  if [ -x "$IMITATION_DIR/.venv/bin/pip" ]; then
+    print INFO "imitation venv already exists - skipping creation"
+  else
+    # Create the venv with access to the system ROS packages (rclpy,
+    # datatypes, trajectory_msgs) which are provided by the ROS overlay, not pip.
+    python3 -m venv --system-site-packages "$IMITATION_DIR/.venv" \
+      || { print ERROR "failed to create imitation virtual environment"; return 1; }
+  fi
 
   "$IMITATION_DIR/.venv/bin/pip" install --upgrade pip
   "$IMITATION_DIR/.venv/bin/pip" install -r "$IMITATION_DIR/requirements.txt" \
@@ -300,7 +414,9 @@ function move_setup_files() {
     return 1
   fi
 
-  sudo ln -s "$source_file" "$target_file"
+  # -f: ein zweiter Lauf soll den bereits bestehenden Symlink ersetzen
+  # statt mit "File exists" fehlzuschlagen.
+  sudo ln -sf "$source_file" "$target_file"
 
   sudo chmod 755 "$source_file"
   print SUCCESS "Installed update script"
@@ -483,19 +599,34 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Ab hier laufen keine interaktiven Prompts mehr (Sudoers-Setup und die
+# Distributions-Abfrage oben sind durch) - die Gauge kann jetzt uebernehmen.
+# 16 fixe Schritte + eine grobe Schaetzung von 13 fuer die Docker-Phase
+# (10 Backend-Services + hoch + 1 Frontend-Service + hoch); die Schaetzung
+# wird in docker_install.sh per progress_add_total auf die echte Anzahl
+# korrigiert, sobald die Compose-Dateien ausgelesen werden koennen.
+progress_start 29
+
 if is_ubuntu_noble; then
+  progress_step "Entferne ungenutzte Standard-Software"
   remove_apps || print ERROR "failed to remove default software"
 fi
 
 if is_supported_raspbian; then
+  progress_step "Stromversorgung/Watchdog konfigurieren"
   disable_power_notification || print ERROR "failed to disable power notifications"
 fi
 
+progress_step "Systempakete installieren"
 install_system_packages || { print ERROR "failed to install system packages"; exit 1; }
+progress_step "Locale einrichten"
 install_locale || { print ERROR "failed to install locale"; exit 1; }
+progress_step "pib-backend und Cerebra klonen/aktualisieren"
 clone_repositories || { print ERROR "failed to clone repositories"; exit 1; }
+progress_step "Imitation-Projekt einrichten"
 install_imitation || print ERROR "failed to install imitation project"
 if is_supported_raspbian && [ "$DIST_VERSION" = "trixie" ]; then
+  progress_step "ROS 2 Jazzy (optionales Host-Overlay) installieren"
   # Non-fatal: this only builds an OPTIONAL native ROS 2 Jazzy overlay so the
   # host CLI can inspect ROS nodes running inside the Docker containers (see
   # ros_jazzy_install.sh) - Cerebra/pib-backend themselves run entirely via
@@ -503,21 +634,27 @@ if is_supported_raspbian && [ "$DIST_VERSION" = "trixie" ]; then
   # failure here must not block them.
   source "$SETUP_INSTALLATION_DIR/ros_jazzy_install.sh" || print ERROR "failed to install ROS 2 Jazzy (native host overlay) - continuing without it, Cerebra runs via Docker regardless"
 fi
+progress_step "Update-Skript und Desktop-Dateien einrichten"
 move_setup_files || print ERROR "failed to move setup files"
+progress_step "DB-Browser installieren"
 install_DBbrowser || print ERROR "failed to install DB browser"
+progress_step "Tinkerforge-Treiber installieren"
 install_tinkerforge || print ERROR "failed to install tinkerforge"
+progress_step "IP-Dispatcher einrichten"
 setup_ip_dispatcher || print ERROR "failed to setup ip dispatcher"
+progress_step "Systemeinstellungen setzen"
 source "$SETUP_INSTALLATION_DIR/set_system_settings.sh" || print ERROR "failed to set system settings"
-print INFO "${INSTALL_METHOD}"
 if [ "$INSTALL_METHOD" = "legacy" ]; then
-  print INFO "Going to install Cerebra locally (LEGACY MODE NOT WORKING ON RASPBERRY PI 5)"
+  progress_step "Cerebra lokal installieren (Legacy-Modus)"
   source "$SETUP_INSTALLATION_DIR/local_install.sh" || print ERROR "failed to install Cerebra locally"
 elif is_ubuntu_noble || is_supported_raspbian; then
-  print INFO "Going to install Cerebra via Docker"
   source "$SETUP_INSTALLATION_DIR/docker_install.sh" || print ERROR "failed to install Cerebra via Docker"
+  progress_step "Benutzer zur docker-Gruppe hinzufuegen"
   sudo usermod -aG docker pib || { print ERROR "failed to add user 'pib' to docker group"; exit 1; }
 fi
+progress_step "Aufraeumen"
 cleanup
+progress_end
 
 print SUCCESS "Finished installation, for more information on how to use pib and Cerebra, visit https://pib-rocks.atlassian.net/wiki/spaces/kb/overview?homepageId=65077450"
 print SUCCESS "Reboot pib to apply all changes"
