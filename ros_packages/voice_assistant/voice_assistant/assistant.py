@@ -613,22 +613,29 @@ class VoiceAssistantNode(Node):
 
         # GEMINI path: short-circuit legacy logic
         if "gemini" in api_name:
-            if not self.gemini_loop.is_listening:
-                # read the API key fresh on every activation, so a change
-                # in Settings takes effect without restarting this node
-                key_successful, llm_settings = llm_settings_client.get_llm_settings()
-                self.gemini_loop.api_key = (
-                    llm_settings.get("geminiApiKey") or "" if key_successful else ""
+            # Read the API key fresh on every activation (not just the first),
+            # so a change in Settings takes effect without restarting this
+            # node - cheap local call, and gemini_loop.start() below decides
+            # itself whether this is actually a no-op, a restart for a
+            # different chat, or a fresh start (see its docstring).
+            key_successful, llm_settings = llm_settings_client.get_llm_settings()
+            self.gemini_loop.api_key = (
+                llm_settings.get("geminiApiKey") or "" if key_successful else ""
+            )
+            if not self.gemini_loop.api_key:
+                self.get_logger().error(
+                    "no Gemini API key configured (Einstellungen > Chat-LLM) - cannot start"
                 )
-                if not self.gemini_loop.api_key:
-                    self.get_logger().error(
-                        "no Gemini API key configured (Einstellungen > Chat-LLM) - cannot start"
-                    )
-                    return False
-                self.gemini_loop.start(chat_id=chat_id)
+                return False
+
+            was_listening = self.gemini_loop.is_listening
+            # Use effective_chat_id (not the possibly-empty raw chat_id param -
+            # see the "Use a stable chat id" fallback above) so a caller that
+            # relies on the current-chat fallback still starts/restarts the
+            # loop for the right chat instead of an empty id.
+            self.gemini_loop.start(chat_id=effective_chat_id)
+            if not was_listening:
                 self.play_audio_from_file(START_SIGNAL_FILE)
-            else:
-                self.get_logger().debug("Gemini already running; no-op")
 
             self.state.turned_on = True
             self.state.chat_id = effective_chat_id

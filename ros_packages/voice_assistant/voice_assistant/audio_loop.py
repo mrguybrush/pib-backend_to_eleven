@@ -859,11 +859,30 @@ class GeminiAudioLoop:
     def start(self, chat_id) -> None:
         """
         Start the Gemini audio loop in a background thread.
-        If already running, this is a no-op (defensive).
+
+        If already running for the SAME chat, this is a no-op (defensive).
+        If already running for a DIFFERENT chat, restart with the new
+        chat_id instead of no-opping - this instance is a single, process-
+        wide loop (not one per chat), so without this a second
+        activation - e.g. another browser tab turning the assistant on for
+        a different chat while it's still marked on elsewhere, or the user
+        editing the active personality's description without a full
+        off/on cycle - would silently keep talking with the OLD chat's
+        personality/description, which is exactly what run() only fetches
+        once at the start of a session (see "Read chat personality/
+        description from PIB to seed the model (once)" below).
         """
         if self._is_listening:
-            logger.info("GeminiAudioLoop is already running.")
-            return
+            if chat_id == self._chat_id:
+                logger.info("GeminiAudioLoop is already running for this chat.")
+                return
+            logger.info(
+                "GeminiAudioLoop: chat changed (%s -> %s) while running - "
+                "restarting to pick up the new chat's personality.",
+                self._chat_id,
+                chat_id,
+            )
+            self.stop()
 
         self._chat_id = chat_id
         self._stop_event.clear()
