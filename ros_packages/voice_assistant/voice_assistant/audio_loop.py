@@ -830,9 +830,15 @@ class GeminiAudioLoop:
         self._accum_text: str = ""
         self._last_pib_message_id: str = ""
         self._current_role: Optional[str] = None  # "user" | "assistant" | None
+        # Monotonic id of the current logical message (bumped by _start_new_stream).
+        # Enqueued alongside every chat request so the worker - the SINGLE authority
+        # on the effective message_id - knows which pieces belong to the same message
+        # and can decide CREATE vs UPDATE itself, instead of trusting the possibly
+        # stale message_id captured at enqueue time. See _chat_worker for why.
+        self._stream_seq: int = 0
 
         # Chat update worker (so DB/UI updates don't block audio)
-        self._chat_queue: "queue.Queue[CreateOrUpdateChatMessage.Request]" = (
+        self._chat_queue: "queue.Queue[Optional[tuple[int, CreateOrUpdateChatMessage.Request]]]" = (
             queue.Queue(maxsize=32)
         )
         self._chat_worker: Optional[threading.Thread] = None
@@ -1070,20 +1076,37 @@ class GeminiAudioLoop:
 
         def _worker():
             logger.debug("Chat worker thread started.")
+            # The worker is the SINGLE authority on the effective message_id, so
+            # the CREATE-then-UPDATE decision is made serially here and can't race
+            # the async responses. worker_seq tracks which logical message these
+            # pieces belong to; worker_msg_id is the id the CREATE returned for it.
+            worker_seq: Optional[int] = None
+            worker_msg_id: str = ""
             while not self._stop_event.is_set():
                 try:
-                    req = self._chat_queue.get(timeout=0.5)
+                    item = self._chat_queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
 
-                if req is None:
+                if item is None:
                     # Sentinel for shutdown
                     break
+
+                seq, req = item
+                # A new logical message: forget the previous id so this piece
+                # CREATEs a fresh message instead of updating the old one.
+                if seq != worker_seq:
+                    worker_seq = seq
+                    worker_msg_id = ""
 
                 try:
                     self._ensure_srv_client()
                     if self._srv_client is None:
                         continue
+
+                    # Authoritative: "" on the first piece of a stream (CREATE),
+                    # then the id the CREATE returned for every later piece (UPDATE).
+                    req.message_id = worker_msg_id
 
                     future = self._srv_client.call_async(req)
                     with RCLPY_SPIN_LOCK:
@@ -1096,8 +1119,9 @@ class GeminiAudioLoop:
                         and future.result() is not None
                         and future.result().successful
                     ):
-                        # keep message_id for subsequent UPDATEs
-                        self._last_pib_message_id = future.result().message_id
+                        # keep message_id for subsequent UPDATEs of this stream
+                        worker_msg_id = future.result().message_id
+                        self._last_pib_message_id = worker_msg_id
                 except Exception:
                     logger.error(
                         "Chat worker: service call failed or timed out.", exc_info=True
@@ -1125,6 +1149,10 @@ class GeminiAudioLoop:
         self._current_role = role
         self._accum_text = ""
         self._last_pib_message_id = ""
+        # New logical message: bump the stream id AFTER the flush above (which
+        # still belongs to the previous message) so the worker treats the next
+        # pieces as a fresh CREATE instead of updating the previous message.
+        self._stream_seq += 1
 
     def _send_chat_piece(
         self,
@@ -1155,11 +1183,15 @@ class GeminiAudioLoop:
         req.text = self._accum_text
         req.is_user = is_user
         req.update_database = update_db
-        req.message_id = self._last_pib_message_id  # "" -> CREATE on first call
+        # Provisional only - the worker overwrites this with the authoritative
+        # message_id for this stream right before the call (see _chat_worker),
+        # because self._last_pib_message_id here may still be "" for pieces
+        # enqueued before the first CREATE's response has come back.
+        req.message_id = self._last_pib_message_id
 
-        # 3) Queue for chat worker
+        # 3) Queue for chat worker, tagged with the current stream id
         try:
-            self._chat_queue.put_nowait(req)
+            self._chat_queue.put_nowait((self._stream_seq, req))
         except queue.Full:
             logger.debug("Chat worker queue full, dropping chat update.")
 
