@@ -103,7 +103,14 @@ def _create_bricklet_data() -> None:
         "acceleration": 5000,
         "deceleration": 3000,
         "period": 19500,
-        "turned_on": True,
+        # Motoren starten deaktiviert. Jede Pin-Zuordnung ist Hardware-
+        # spezifisch (siehe bricklet_pins-Kommentar unten) - mit turned_on=
+        # True waeren auf einem frisch verkabelten/nicht ueberprueften
+        # Roboter sofort alle Servos aktiv, sobald der Motorstrom
+        # eingeschaltet wird, und fahren auf Basis einer eventuell falschen
+        # Pin-Zuordnung unkontrolliert los. Der Nutzer schaltet jeden Motor
+        # erst bewusst ein, nachdem dessen Pin-Zuordnung stimmt.
+        "turned_on": False,
         "visible": True,
         "invert": False,
     }
@@ -286,35 +293,47 @@ def _get_motor_list() -> [dict[str, Any]]:
     name: str = "name"
     bricklet_pins: str = "bricklet_pins"
 
+    # Kein Motor bekommt hier eine Pin-Zuordnung mit auf den Weg. Welcher
+    # Bricklet/Pin zu welchem Motor gehoert, ist reine Verkabelungssache
+    # dieses EINEN physischen Roboters - je nach Baujahr/Reparaturstand
+    # unterschiedlich (z.B. durchgebrannte Pins, die auf einen anderen Pin
+    # umgelegt wurden). Eine hier hartcodierte Zuordnung wird an jeden
+    # Roboter verteilt, egal wie er tatsaechlich verkabelt ist, und fuehrt
+    # bei abweichender Verkabelung dazu, dass beim Einschalten des
+    # Motorstroms Positionsbefehle beim FALSCHEN Motor ankommen (siehe
+    # motor_settings oben: turned_on=False schuetzt zusaetzlich davor, dass
+    # das ueberhaupt passieren kann, bevor die Zuordnung geprueft ist).
+    # Die tatsaechliche Zuordnung passiert bewusst danach, pro Roboter, ueber
+    # die Pin-Zuweisung in der Weboberflaeche (manuell oder per Import einer
+    # zuvor exportierten Zuordnung desselben Roboters) - siehe
+    # bricklet_pin_controller.py (assign_pin/export/import).
     return [
-        # pins 4 and 5 on servo-bricklet 2 are burned on this robot -
-        # head motors moved to the free pins 3 and 6 (2026-07)
-        {name: "turn_head_motor", bricklet_pins: [(2, 3)]},
-        {name: "tilt_forward_motor", bricklet_pins: [(2, 6)]},
-        {name: "upper_arm_left_rotation", bricklet_pins: [(3, 9)]},
-        {name: "elbow_left", bricklet_pins: [(3, 8)]},
-        {name: "lower_arm_left_rotation", bricklet_pins: [(3, 7)]},
-        {name: "shoulder_vertical_left", bricklet_pins: [(2, 9)]},
-        {name: "shoulder_horizontal_left", bricklet_pins: [(2, 8)]},
-        {name: "upper_arm_right_rotation", bricklet_pins: [(1, 9)]},
-        {name: "elbow_right", bricklet_pins: [(1, 8)]},
-        {name: "lower_arm_right_rotation", bricklet_pins: [(1, 7)]},
-        {name: "shoulder_vertical_right", bricklet_pins: [(2, 1)]},
-        {name: "shoulder_horizontal_right", bricklet_pins: [(2, 0)]},
-        {name: "thumb_right_opposition", bricklet_pins: [(1, 0)]},
-        {name: "thumb_right_stretch", bricklet_pins: [(1, 1)]},
-        {name: "index_right_stretch", bricklet_pins: [(1, 2)]},
-        {name: "middle_right_stretch", bricklet_pins: [(1, 3)]},
-        {name: "ring_right_stretch", bricklet_pins: [(1, 4)]},
-        {name: "pinky_right_stretch", bricklet_pins: [(1, 5)]},
-        {name: "thumb_left_opposition", bricklet_pins: [(3, 0)]},
-        {name: "thumb_left_stretch", bricklet_pins: [(3, 1)]},
-        {name: "index_left_stretch", bricklet_pins: [(3, 2)]},
-        {name: "middle_left_stretch", bricklet_pins: [(3, 3)]},
-        {name: "ring_left_stretch", bricklet_pins: [(3, 4)]},
-        {name: "pinky_left_stretch", bricklet_pins: [(3, 5)]},
-        {name: "wrist_left", bricklet_pins: [(3, 6)]},
-        {name: "wrist_right", bricklet_pins: [(1, 6)]},
+        {name: "turn_head_motor", bricklet_pins: []},
+        {name: "tilt_forward_motor", bricklet_pins: []},
+        {name: "upper_arm_left_rotation", bricklet_pins: []},
+        {name: "elbow_left", bricklet_pins: []},
+        {name: "lower_arm_left_rotation", bricklet_pins: []},
+        {name: "shoulder_vertical_left", bricklet_pins: []},
+        {name: "shoulder_horizontal_left", bricklet_pins: []},
+        {name: "upper_arm_right_rotation", bricklet_pins: []},
+        {name: "elbow_right", bricklet_pins: []},
+        {name: "lower_arm_right_rotation", bricklet_pins: []},
+        {name: "shoulder_vertical_right", bricklet_pins: []},
+        {name: "shoulder_horizontal_right", bricklet_pins: []},
+        {name: "thumb_right_opposition", bricklet_pins: []},
+        {name: "thumb_right_stretch", bricklet_pins: []},
+        {name: "index_right_stretch", bricklet_pins: []},
+        {name: "middle_right_stretch", bricklet_pins: []},
+        {name: "ring_right_stretch", bricklet_pins: []},
+        {name: "pinky_right_stretch", bricklet_pins: []},
+        {name: "thumb_left_opposition", bricklet_pins: []},
+        {name: "thumb_left_stretch", bricklet_pins: []},
+        {name: "index_left_stretch", bricklet_pins: []},
+        {name: "middle_left_stretch", bricklet_pins: []},
+        {name: "ring_left_stretch", bricklet_pins: []},
+        {name: "pinky_left_stretch", bricklet_pins: []},
+        {name: "wrist_left", bricklet_pins: []},
+        {name: "wrist_right", bricklet_pins: []},
     ]
 
 
