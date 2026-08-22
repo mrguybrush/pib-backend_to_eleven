@@ -1,12 +1,25 @@
 [Unit]
 Description=Enables Connections to the host X-Server from within a docker container
+# graphical.target (statt multi-user.target) startet diesen Dienst erst,
+# nachdem der Display-Manager/die grafische Sitzung dran ist - reduziert das
+# Zeitfenster, in dem "xhost" noch keinen X-Server zum Verbinden findet.
+After=graphical.target
 
 [Service]
 User=pib
 Environment=DISPLAY=:0.0
 Restart=on-failure
 RestartSec=5s
+# Ohne dies greift systemds Standard-Ratenlimit (5 Fehlschlaege in 10s) -
+# startet der Desktop (Xwayland/labwc) auf einem langsamen Boot spaeter als
+# das, gibt systemd nach ein paar Versuchen dauerhaft auf ("start-limit-hit"),
+# bis jemand den Dienst manuell neu startet. Das war die Ursache dafuer, dass
+# die Augenanzeige nach einem Neustart teils minutenlang nicht erschien:
+# "xhost +local:" kam nie durch, der ros-display-Container bekam nie Zugriff
+# auf den X-Server. Mit StartLimitIntervalSec=0 versucht es unbegrenzt oft
+# alle 5s weiter, bis der Desktop bereit ist - egal wie lange der Boot dauert.
+StartLimitIntervalSec=0
 ExecStart=/usr/bin/xhost +local:
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
