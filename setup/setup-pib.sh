@@ -403,6 +403,79 @@ function install_imitation() {
 }
 
 
+# Download the local Piper TTS voice models that Cerebra's "Lokale
+# Sprachausgabe (Piper)" dropdown offers. Without them the ros-voice-assistant
+# container logs 'local voice "<id>" enabled but not installed', falls back to
+# the (by default unconfigured) cloud TTS and then produces NO audio at all -
+# i.e. a fresh install is mute until these files exist.
+#
+# voice_assistant/piper_tts.py expects each voice under:
+#   $HOME/piper/voices/<id>/<id>.onnx   (+ <id>.onnx.json)
+# which docker-compose bind-mounts read-only into the container as
+# PIPER_HOME=/opt/piper. The <id> list below must stay in sync with the voices
+# pib_api/flask/controller/voice_settings_controller.py serves to the frontend.
+function install_piper_voices() {
+  local voices_dir="$HOME/piper/voices"
+  local base="https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+  # "<model-id>|<huggingface-subpath>"  (subpath = de/de_DE/<name>/<quality>)
+  local voices=(
+    "de_DE-thorsten-low|de/de_DE/thorsten/low"
+    "de_DE-thorsten-medium|de/de_DE/thorsten/medium"
+    "de_DE-thorsten-high|de/de_DE/thorsten/high"
+    "de_DE-thorsten_emotional-medium|de/de_DE/thorsten_emotional/medium"
+    "de_DE-karlsson-low|de/de_DE/karlsson/low"
+    "de_DE-pavoque-low|de/de_DE/pavoque/low"
+    "de_DE-eva_k-x_low|de/de_DE/eva_k/x_low"
+    "de_DE-kerstin-low|de/de_DE/kerstin/low"
+    "de_DE-ramona-low|de/de_DE/ramona/low"
+    "de_DE-mls-medium|de/de_DE/mls/medium"
+  )
+
+  # A previous Docker run may have created $HOME/piper root-owned (compose
+  # bind-mounts a non-existent host path, which Docker creates as root). Make
+  # sure the pib user can populate it before we start downloading.
+  if [ -e "$HOME/piper" ] && [ ! -w "$HOME/piper" ]; then
+    sudo chown -R "$USER":"$USER" "$HOME/piper"
+  fi
+  mkdir -p "$voices_dir" || { print ERROR "could not create $voices_dir"; return 1; }
+
+  local entry id subpath dir ok_count=0
+  for entry in "${voices[@]}"; do
+    id="${entry%%|*}"
+    subpath="${entry#*|}"
+    dir="$voices_dir/$id"
+    mkdir -p "$dir"
+
+    # Skip voices already fully present (a valid .onnx is well over 1 MB), so
+    # re-running the setup does not re-download ~600 MB every time.
+    if [ -s "$dir/$id.onnx.json" ] \
+       && [ "$(stat -c%s "$dir/$id.onnx" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+      print INFO "Piper voice $id already present - skipping"
+      ok_count=$((ok_count + 1))
+      continue
+    fi
+
+    print INFO "Downloading Piper voice $id"
+    # -c resumes a partial file, --tries/--timeout survive a transient CDN
+    # hiccup (this Pi has no RTC and networking can still be settling right
+    # after a reboot). Download the small .json first, then the large model.
+    if wget -q -c --tries=3 --timeout=60 "$base/$subpath/$id.onnx.json" -O "$dir/$id.onnx.json" \
+       && wget -q -c --tries=3 --timeout=60 "$base/$subpath/$id.onnx" -O "$dir/$id.onnx"; then
+      ok_count=$((ok_count + 1))
+    else
+      print WARN "failed to download Piper voice $id - speech output for this voice will not work"
+    fi
+  done
+
+  if [ "$ok_count" -eq 0 ]; then
+    print ERROR "no Piper voices could be installed - local speech output will not work"
+    return 1
+  fi
+  print SUCCESS "Installed $ok_count/${#voices[@]} Piper voices to $voices_dir"
+}
+
+
 # Install update script; move animated eyes, etc.
 function move_setup_files() {
   local update_target_dir="/usr/local/bin"
@@ -601,11 +674,11 @@ done
 
 # Ab hier laufen keine interaktiven Prompts mehr (Sudoers-Setup und die
 # Distributions-Abfrage oben sind durch) - die Gauge kann jetzt uebernehmen.
-# 16 fixe Schritte + eine grobe Schaetzung von 13 fuer die Docker-Phase
+# 17 fixe Schritte + eine grobe Schaetzung von 13 fuer die Docker-Phase
 # (10 Backend-Services + hoch + 1 Frontend-Service + hoch); die Schaetzung
 # wird in docker_install.sh per progress_add_total auf die echte Anzahl
 # korrigiert, sobald die Compose-Dateien ausgelesen werden koennen.
-progress_start 29
+progress_start 30
 
 if is_ubuntu_noble; then
   progress_step "Entferne ungenutzte Standard-Software"
@@ -634,6 +707,8 @@ if is_supported_raspbian && [ "$DIST_VERSION" = "trixie" ]; then
   # failure here must not block them.
   source "$SETUP_INSTALLATION_DIR/ros_jazzy_install.sh" || print ERROR "failed to install ROS 2 Jazzy (native host overlay) - continuing without it, Cerebra runs via Docker regardless"
 fi
+progress_step "Piper-Sprachmodelle herunterladen"
+install_piper_voices || print ERROR "failed to install Piper voices - local speech output may not work"
 progress_step "Update-Skript und Desktop-Dateien einrichten"
 move_setup_files || print ERROR "failed to move setup files"
 progress_step "DB-Browser installieren"
