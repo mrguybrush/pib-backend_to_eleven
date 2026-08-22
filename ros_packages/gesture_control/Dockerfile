@@ -1,15 +1,10 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - keine weiteren apt-Pakete noetig hier.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install --no-install-recommends -y \
-        build-essential \
-        python3-colcon-common-extensions \
-        python3-colcon-mixin \
-        python3-pip \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY ./pib_api/client ./client
 RUN pip install ./client

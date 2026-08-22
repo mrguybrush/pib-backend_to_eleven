@@ -1,17 +1,13 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - curl ist also schon vorhanden.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install --no-install-recommends -y curl
-
 RUN apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y \
-        build-essential \
-        python3-colcon-common-extensions \
-        python3-colcon-mixin \
-        python3-pip \
         pulseaudio \
         portaudio19-dev \
         libusb-1.0-0-dev \

@@ -169,9 +169,32 @@ function docker_compose_up_retry() {
     return 1
 }
 
+# Baut das gemeinsame ROS-Basis-Image (siehe ros_packages/base/Dockerfile),
+# von dem 9 der 10 Backend-Dockerfiles per "FROM pib-ros-base:humble" erben
+# (nur camera erbt von luxonis/depthai-ros und braucht es nicht). Muss vor
+# docker_compose_build_sequential fuer's Backend laufen, sonst schlagen deren
+# Builds mit "pib-ros-base:humble: not found" fehl. Vorher installierte jedes
+# der 9 Images build-essential/colcon-Erweiterungen/pip/curl unabhaengig -
+# identischer Inhalt, aber 9x heruntergeladen/entpackt (der groesste Teil der
+# Gesamt-Bauzeit) und 9x eine eigene Angriffsflaeche fuer transiente apt-
+# Fehler. Einmal hier bauen spart beides.
+function build_ros_base_image() {
+    progress_step "Gemeinsames ROS-Basis-Image bauen"
+    local attempt
+    for attempt in 1 2 3; do
+        if sudo docker build -t pib-ros-base:humble -f "$BACKEND_DIR/ros_packages/base/Dockerfile" "$BACKEND_DIR"; then
+            return 0
+        fi
+        print WARN "Bau des ROS-Basis-Image fehlgeschlagen (Versuch ${attempt}/3), neuer Versuch in 15s..."
+        sleep 15
+    done
+    return 1
+}
+
 function start_container() {
     print INFO "Starting container"
     echo "TRYB_URL_PREFIX=https://platform.tryb.ai" > "$BACKEND_DIR"/password.env
+    build_ros_base_image || { print ERROR "failed to build shared ROS base image"; return 1; }
     docker_compose_build_sequential "$BACKEND_DIR/docker-compose.yaml" "Backend" 10 --profile all || return 1
     progress_step "Backend-Container starten"
     docker_compose_up_retry "$BACKEND_DIR/docker-compose.yaml" --profile all || return 1

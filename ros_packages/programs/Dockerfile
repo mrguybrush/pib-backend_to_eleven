@@ -1,21 +1,15 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - keine weiteren apt-Pakete noetig hier.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
-
-RUN apt-get update && apt-get install --no-install-recommends -y \
-    build-essential \
-    python3-colcon-common-extensions \
-    python3-colcon-mixin \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY ./pib_blockly/pib_blockly_client /tmp/pib_blockly_client
 COPY ./pib_api/client /tmp/pib_api_client
 COPY ./ros_packages/motors/pib_motors /tmp/pib_motors
-RUN apt-get update --fix-missing && \
-    apt-get install --no-install-recommends -y python3-pip && \
-    pip install /tmp/pib_blockly_client && \
+RUN pip install /tmp/pib_blockly_client && \
     pip install /tmp/pib_api_client && \
     pip install /tmp/pib_motors && \
     pip install requests==2.32.3 && \

@@ -1,11 +1,10 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - hier nur noch das Service-Spezifische.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 RUN apt update && apt upgrade -y && apt install -y \
-    build-essential \
-    python3-colcon-common-extensions \
-    python3-colcon-mixin \
     ros-$ROS_DISTRO-rosbridge-server&& \
     apt-get autoremove -y && \
     apt-get clean && \

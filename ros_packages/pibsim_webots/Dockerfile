@@ -1,4 +1,6 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - hier nur noch das Service-Spezifische.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
@@ -11,13 +13,9 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
       && rm -rf /var/lib/apt/lists/*
 
 RUN wget -O /tmp/webots.deb \
-        https://github.com/cyberbotics/webots/releases/download/R2025a/webots_2025a_amd64.deb     
+        https://github.com/cyberbotics/webots/releases/download/R2025a/webots_2025a_amd64.deb
 
-RUN apt-get update --fix-missing && apt-get install --no-install-recommends -y \ 
-        build-essential \
-        python3-colcon-common-extensions \
-        python3-colcon-mixin \
-        python3-pip \
+RUN apt-get update --fix-missing && apt-get install --no-install-recommends -y \
         /tmp/webots.deb \
         ros-humble-webots-ros2 \
     && rm /tmp/webots.deb \

@@ -1,10 +1,10 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - curl ist also schon vorhanden.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install --no-install-recommends -y curl
 
 # --retry-all-errors: curl's default --retry only retries timeouts/5xx, not a
 # transient DNS lookup failure (exit code 6) - that's the exact failure this
@@ -15,10 +15,6 @@ RUN curl --retry 5 --retry-all-errors --retry-delay 5 -sSL https://download.tink
     echo "deb [signed-by=/usr/share/keyrings/tinkerforge.gpg] https://download.tinkerforge.com/apt/$(. /etc/os-release; echo $ID $VERSION_CODENAME) main" > /etc/apt/sources.list.d/tinkerforge.list && \
     apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y \
-        build-essential \
-        python3-colcon-common-extensions \
-        python3-colcon-mixin \
-        python3-pip \
         python3-tinkerforge \
         libusb-1.0-0-dev \
     && rm -rf /var/lib/apt/lists/*

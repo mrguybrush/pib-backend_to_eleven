@@ -1,19 +1,16 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - hier nur noch das Service-Spezifische.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
-    build-essential \
-    python3-colcon-common-extensions \
-    python3-colcon-mixin \
     python3-tk \
     && rm -rf /var/lib/apt/lists/*
-    
+
 WORKDIR /app
 
-RUN apt-get update --fix-missing && \
-    apt-get install --no-install-recommends -y python3-pip && \
-    pip install requests==2.32.3 && \
+RUN pip install requests==2.32.3 && \
     pip install pillow && \
     pip install qrcode
 

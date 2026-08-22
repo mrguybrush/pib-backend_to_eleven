@@ -1,22 +1,18 @@
-FROM ros:humble-ros-core
+# pib-ros-base:humble = ros:humble-ros-core + build-essential/colcon/pip/curl
+# (siehe ros_packages/base/Dockerfile) - hier nur noch das Service-Spezifische.
+FROM pib-ros-base:humble
 
 SHELL ["/bin/bash", "-c"]
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install --no-install-recommends -y curl
-
 # Install necessary dependencies
 RUN apt-get update --fix-missing && \
     apt-get install --no-install-recommends -y \
-        python3-pip \
-        python3-colcon-common-extensions \
         ros-humble-rclpy \
         ros-humble-std-msgs \
         python3-usb \
         portaudio19-dev \
-        build-essential \
-        python3-colcon-mixin \
         pulseaudio \
         libusb-1.0-0-dev \
     && rm -rf /var/lib/apt/lists/*
